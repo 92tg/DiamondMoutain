@@ -17,7 +17,7 @@ K.MACHINE_REACH = 8
 K.CAMP_TOLERANCE = 12
 K.LIB_FILE = "VyLib.lua"
 K.LIB_URLS = {
-    "https://raw.githubusercontent.com/Dexz00/DzHub/refs/heads/main/VyLib/VyLib.lua",
+    "https://raw.githubusercontent.com/92tg/VYHUB/main/VyLib.lua",
 }
 
 K.CAMPS = {
@@ -154,7 +154,7 @@ local function loadLibrary()
             if ok and type(content) == "string" and #content > 1000 then src = content break end
         end
     end
-    assert(src, "VyLib could not be loaded: put VyLib.lua in the Potassium workspace folder")
+    assert(src, "VyLib could not be loaded from github.com/92tg/VYHUB (no internet / HttpGet blocked?)")
     if genv.Library and type(genv.Library.Unload) == "function" then pcall(function() genv.Library:Unload() end) end
     local fn, err = loadstring(src, "=VyLib")
     assert(fn, "VyLib failed to compile: " .. tostring(err))
