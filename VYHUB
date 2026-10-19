@@ -1460,6 +1460,8 @@ local function saveResume()
         if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder("VYHUB") then makefolder("VYHUB") end
         writefile(K.RESUME_FILE, game:GetService("HttpService"):JSONEncode({
             at = os.time(),
+            originPlace = game.PlaceId,
+            world = K.WORLD_PLACES and K.WORLD_PLACES[game.PlaceId] or nil,
             autoTrail = F.autoTrail,
             trailChoice = F.trailChoice,
             trailHatch = F.trailHatch,
@@ -1488,8 +1490,8 @@ local function queueReexec()
     pcall(queue_on_teleport, src)
 end
 
-local function pickOtherServer()
-    local placeId = game.PlaceId
+local function pickOtherServer(placeId)
+    placeId = placeId or game.PlaceId
     local body
     for _, order in ipairs({ "Desc", "Asc" }) do
         local ok, b = pcall(game.HttpGet, game, string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100", placeId, order))
@@ -1509,21 +1511,71 @@ local function pickOtherServer()
     return choices[math.random(1, #choices)]
 end
 
+K.ROOT_PLACE = 8737899170
+K.WORLD_PLACES = { [8737899170] = 1, [16498369169] = 2, [17503543197] = 3, [140403681187145] = 4 }
+
+local function rootPlaceId()
+    if K.WORLD_PLACES[game.PlaceId] then return K.ROOT_PLACE end
+    local ok, body = pcall(game.HttpGet, game, "https://games.roblox.com/v1/games?universeIds=" .. tostring(game.GameId))
+    if ok and type(body) == "string" then
+        local id = tonumber(body:match('"rootPlaceId":(%d+)'))
+        if id then return id end
+    end
+    return K.ROOT_PLACE
+end
+
+local function inPrivateServer()
+    local ok, v = pcall(function() return game.PrivateServerId ~= "" and game.PrivateServerOwnerId ~= 0 end)
+    return ok and v == true
+end
+
+local function privateServerAccessCode()
+    local ok, body = pcall(game.HttpGet, game, string.format("https://games.roblox.com/v1/games/%d/private-servers?limit=100", game.GameId))
+    if not ok or type(body) ~= "string" then return nil end
+    local okJ, data = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+    if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then return nil end
+    local want = tostring(game.PrivateServerId)
+    local first
+    for _, s in ipairs(data.data) do
+        if type(s) == "table" and type(s.accessCode) == "string" then
+            first = first or s.accessCode
+            if tostring(s.vipServerId) == want or tostring(s.id) == want then return s.accessCode end
+        end
+    end
+    return first
+end
+
 local function doTeleport(sameServer)
     if V.teleporting then return end
     V.teleporting = true
+    local root = rootPlaceId()
     saveResume()
     queueReexec()
     local TS = game:GetService("TeleportService")
     local ok, err = pcall(function()
+        if inPrivateServer() then
+            local code = privateServerAccessCode()
+            if code then
+                TS:TeleportToPrivateServer(root, code, { LocalPlayer })
+                return
+            end
+            if sameServer then
+                TS:TeleportToPlaceInstance(root, game.JobId, LocalPlayer)
+                return
+            end
+        end
         if sameServer then
-            TS:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
-        else
-            local target = pickOtherServer()
-            if target then
-                TS:TeleportToPlaceInstance(game.PlaceId, target, LocalPlayer)
+            if game.PlaceId == root then
+                TS:TeleportToPlaceInstance(root, game.JobId, LocalPlayer)
             else
-                TS:Teleport(game.PlaceId, LocalPlayer)
+                TS:Teleport(root, LocalPlayer)
+            end
+        else
+            local target = pickOtherServer(root)
+            if target then
+                TS:TeleportToPlaceInstance(root, target, LocalPlayer)
+            else
+                TS:Teleport(root, LocalPlayer)
             end
         end
     end)
@@ -2094,6 +2146,17 @@ task.spawn(function()
         setFlag("autoTap", "dm_autoTap")
         setFlag("autoTrail", "dm_autoTrail")
         log("resumed trail settings after server teleport")
+        if resume.originPlace and resume.originPlace ~= game.PlaceId and type(resume.world) == "number" and resume.world > 1 then
+            local okE = enterInstance()
+            if not okE then
+                log("Diamond Mountain not reachable here, teleporting to World %d", resume.world)
+                saveResume()
+                queueReexec()
+                local okW, errW = netInvoke("World" .. resume.world .. "Teleport")
+                if not okW then warnlog("world teleport failed: %s", tostring(errW)) end
+                return
+            end
+        end
     end
     local ok, err = enterInstance()
     if ok then
