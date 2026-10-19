@@ -45,13 +45,13 @@ K.UPGRADES = {
     { Key = "TrailLuck",       Id = "DiamondMountainTrailLuck",       Name = "Trail Luck" },
     { Key = "ExpeditionSpeed", Id = "DiamondMountainExpeditionSpeed", Name = "Expedition Speed" },
 }
-K.OBJECTIVES = { "Balanced (cheapest first)", "Luck (eggs)", "Acorns (farming)", "Walls / Yeti damage", "Expeditions" }
+K.OBJECTIVES = { "Cheapest First", "Egg Luck", "More Acorns", "Wall & Yeti Damage", "Faster Expeditions" }
 K.OBJECTIVE_ORDER = {
-    ["Balanced (cheapest first)"] = nil,
-    ["Luck (eggs)"]            = { "TrailLuck", "CoinFinder", "WallPower", "OfflineHours", "ExpeditionSpeed" },
-    ["Acorns (farming)"]       = { "CoinFinder", "WallPower", "OfflineHours", "TrailLuck", "ExpeditionSpeed" },
-    ["Walls / Yeti damage"]    = { "WallPower", "OfflineHours", "CoinFinder", "TrailLuck", "ExpeditionSpeed" },
-    ["Expeditions"]            = { "ExpeditionSpeed", "OfflineHours", "CoinFinder", "TrailLuck", "WallPower" },
+    ["Cheapest First"]     = nil,
+    ["Egg Luck"]           = { "TrailLuck", "CoinFinder", "WallPower", "OfflineHours", "ExpeditionSpeed" },
+    ["More Acorns"]        = { "CoinFinder", "WallPower", "OfflineHours", "TrailLuck", "ExpeditionSpeed" },
+    ["Wall & Yeti Damage"] = { "WallPower", "OfflineHours", "CoinFinder", "TrailLuck", "ExpeditionSpeed" },
+    ["Faster Expeditions"] = { "ExpeditionSpeed", "OfflineHours", "CoinFinder", "TrailLuck", "WallPower" },
 }
 
 K.BOOSTS = {
@@ -205,6 +205,10 @@ G.EnchantCmds = req("Library.Client.EnchantCmds")
 G.UpgradeCmds = req("Library.Client.UpgradeCmds")
 G.MachineCmds = req("Library.Client.MachineCmds")
 G.BreakableFrontend = req("Library.Client.BreakableFrontend")
+G.Directory = req("Library.Directory")
+G.MasteryCmds = req("Library.Client.MasteryCmds")
+G.Functions = req("Library.Functions")
+G.TeleportMap = req("Library.Client.TeleportMapCmds")
 
 local function netInvoke(name, ...)
     if not isfn(G.Network, "Invoke") then return false, "Network.Invoke unavailable" end
@@ -1097,10 +1101,59 @@ local function offerName(o)
     return type(data) == "table" and tostring(data.id or data._id or "?") or "?"
 end
 
+local function merchantLedger()
+    local s = getSave()
+    local mp = s and type(s.MerchantPurchases) == "table" and s.MerchantPurchases[K.MERCHANT] or nil
+    if type(mp) ~= "table" then return nil end
+    local purchases = type(mp.Purchases) == "table" and mp.Purchases or {}
+    local bought = 0
+    for i = 1, 6 do
+        if (tonumber(purchases[tostring(i)] or purchases[i]) or 0) >= 1 then bought += 1 end
+    end
+    return { seed = mp.Seed, purchases = purchases, bought = bought }
+end
+
+local function merchantRestockRate()
+    local rate
+    if type(G.Directory) == "table" then
+        local okR, r = gcall(function() return G.Directory.Merchants[K.MERCHANT].RefreshRate end)
+        if okR and type(r) == "number" and r >= 60 then rate = r end
+    end
+    rate = rate or 10800
+    if isfn(G.MasteryCmds, "GetPerkPower") then
+        local perk = gval(G.MasteryCmds.GetPerkPower, "Economy", "FasterMerchants")
+        if type(perk) == "number" and perk > 0 then rate = rate / perk end
+    end
+    return rate
+end
+
+local function merchantWindow()
+    local rate = merchantRestockRate()
+    local pOff, mOff = 0, 0
+    if isfn(G.Functions, "CRC32") then
+        pOff = (tonumber(gval(G.Functions.CRC32, tostring(LocalPlayer.UserId))) or 0) % 60
+        mOff = (tonumber(gval(G.Functions.CRC32, K.MERCHANT)) or 0) % 60
+    end
+    local now = math.floor(workspace:GetServerTimeNow())
+    local nextAt = now + (rate - (now + pOff + mOff) % rate)
+    return nextAt - rate, nextAt
+end
+
+V.merchantDoneWindow = nil
+V.merchantPartialAt = 0
+V.merchantRetryAt = 0
 local function merchantRun()
     local ph = merchantPhase()
     if not (ph and ph.Arrived) then return end
-    if V.merchantVisitDone == ph.Visit and os.clock() < V.merchantRetryAt then return end
+    if os.clock() < V.merchantRetryAt then return end
+    local lastB, nextB = merchantWindow()
+    local ledger = merchantLedger()
+    local need = V.merchantDoneWindow ~= lastB
+    if not need and ledger and ledger.bought < 6 and os.clock() - V.merchantPartialAt > 300 then need = true end
+    if not need then
+        state.merchantNote = string.format("%d/6 bought, restock in %dm", ledger and ledger.bought or 6, math.max(0, math.floor((nextB - workspace:GetServerTimeNow()) / 60)))
+        return
+    end
     local stop = merchantStop(ph.Camp)
     if not stop then logOnce("nomerchantstop", "merchant stop part for camp %s not found", tostring(ph.Camp)) return end
     local t0 = os.clock()
@@ -1123,34 +1176,51 @@ local function merchantRun()
         teleportTo(standPos, stop.Position)
         task.wait(0.8)
         local data = merchantOffers()
-        if not (data and type(data.Offers) == "table") then
-            V.merchantRetryAt = os.clock() + 30
-            logOnce("nooffers-" .. tostring(ph.Visit), "merchant offers not available yet (visit %s)", tostring(ph.Visit))
-            return
+        local tw = os.clock()
+        while state.alive and not data and os.clock() - tw < 3 do
+            task.wait(0.5)
+            data = merchantOffers()
         end
+        local offers = data and type(data.Offers) == "table" and data.Offers or nil
         local lvl = respectLevel()
-        local idx = {}
-        for k in pairs(data.Offers) do idx[#idx + 1] = tonumber(k) or k end
-        table.sort(idx, function(a, b) return tostring(a) < tostring(b) end)
-        local bought, skipped = 0, 0
-        for _, i in ipairs(idx) do
-            local o = data.Offers[tostring(i)] or data.Offers[i]
-            if type(o) == "table" and (o.Stock or 0) > 0 and (o.Respect or 0) <= lvl and (not F.merchantOnlyBoosts or offerIsBoost(o)) then
-                local ok, res, msg = netInvoke("Merchant_RequestPurchase", K.MERCHANT, tonumber(i) or i)
+        local n = 6
+        if offers then
+            local c = 0
+            for _ in pairs(offers) do c += 1 end
+            if c > 0 then n = c end
+        end
+        local bought, skipped, notHere = 0, 0, false
+        for i = 1, n do
+            local o = offers and (offers[tostring(i)] or offers[i]) or nil
+            local already = ledger ~= nil and data ~= nil and ledger.seed == data.Seed and (tonumber(ledger.purchases[tostring(i)] or ledger.purchases[i]) or 0) >= 1
+            local skip = already or (o ~= nil and (o.Respect or 0) > lvl) or (o ~= nil and F.merchantOnlyBoosts and not offerIsBoost(o))
+            if skip then
+                skipped += 1
+            else
+                local ok, res, msg = netInvoke("Merchant_RequestPurchase", K.MERCHANT, i)
+                local text = tostring(msg or res or "")
                 if ok and res == true then
                     bought += 1
                     state.merchantBought += 1
-                    log("merchant: bought %s", offerName(o))
+                    log("merchant: bought %s", o and offerName(o) or ("offer " .. i))
                 else
                     skipped += 1
-                    log("merchant: %s not bought (%s)", offerName(o), tostring(msg or res))
+                    log("merchant: offer %d not bought (%s)", i, text)
+                    if text:lower():find("not here", 1, true) then notHere = true break end
                 end
                 task.wait(0.5)
             end
         end
-        V.merchantVisitDone = ph.Visit
-        V.merchantRetryAt = os.clock() + 120
+        if notHere then
+            V.merchantRetryAt = os.clock() + 30
+            state.status = "merchant not reachable here, retrying in 30s"
+            return
+        end
+        V.merchantDoneWindow = lastB
+        V.merchantPartialAt = os.clock()
         if bought > 0 then notify("Traveling Merchant", string.format("bought %d offer(s) at camp %d", bought, ph.Camp), 5) end
+        local after = merchantLedger()
+        state.merchantNote = string.format("%d/6 bought, restock in %dm", after and after.bought or bought, math.max(0, math.floor((nextB - workspace:GetServerTimeNow()) / 60)))
         state.status = string.format("merchant visit done (%d bought, %d skipped)", bought, skipped)
     end)
     if before and state.alive then teleportTo(before) end
@@ -1447,38 +1517,81 @@ end
 
 V.trailFarmTargets = nil
 V.trailLastTeleport = 0
-F.trailRejoin = false
 F.trailHop = false
 K.RESUME_FILE = "VYHUB/DM_Resume.json"
 K.SCRIPT_URL = "https://raw.githubusercontent.com/92tg/VYHUB/main/VY_DiamondMountain.lua"
 V.trailClosedSince = nil
 V.teleporting = false
 
+K.TRACE_FILE = "VYHUB/DM_TeleportLog.txt"
+local function tlog(fmt, ...)
+    local ok, msg = pcall(string.format, fmt, ...)
+    local line = ok and msg or tostring(fmt)
+    log("%s", line)
+    pcall(function()
+        local entry = os.date("%H:%M:%S") .. " " .. line .. "\n"
+        local exists = type(isfile) == "function" and isfile(K.TRACE_FILE)
+        if exists and type(appendfile) == "function" then
+            appendfile(K.TRACE_FILE, entry)
+        elseif type(writefile) == "function" then
+            local prev = (exists and type(readfile) == "function") and readfile(K.TRACE_FILE) or ""
+            writefile(K.TRACE_FILE, prev .. entry)
+        end
+    end)
+end
+
+local function reservedChain()
+    local ok, data = pcall(function() return game:GetService("TeleportService"):GetLocalPlayerTeleportData() end)
+    return ok and type(data) == "table" and type(data.ReservedCode) == "string" and data.ReservedCode ~= ""
+end
+
+local function inPrivateServer()
+    local ok, v = pcall(function() return tostring(game.PrivateServerId) ~= "" or (tonumber(game.PrivateServerOwnerId) or 0) ~= 0 end)
+    if ok and v then return true end
+    if V.resumePrivate then return true end
+    return reservedChain()
+end
 local function saveResume()
     if type(writefile) ~= "function" then return end
     pcall(function()
         if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder("VYHUB") then makefolder("VYHUB") end
+        local flags = {}
+        if type(Library) == "table" and type(Library.Flags) == "table" then
+            for name, value in pairs(Library.Flags) do
+                if type(name) == "string" and name:sub(1, 3) == "dm_" and (type(value) == "boolean" or type(value) == "number" or type(value) == "string") then
+                    flags[name] = value
+                end
+            end
+        end
         writefile(K.RESUME_FILE, game:GetService("HttpService"):JSONEncode({
             at = os.time(),
             originPlace = game.PlaceId,
             world = K.WORLD_PLACES and K.WORLD_PLACES[game.PlaceId] or nil,
-            autoTrail = F.autoTrail,
-            trailChoice = F.trailChoice,
-            trailHatch = F.trailHatch,
-            trailRejoin = F.trailRejoin,
-            trailHop = F.trailHop,
-            autoFarm = F.autoFarm,
-            fastFarm = F.fastFarm,
-            autoTap = F.autoTap,
+            mode = V.resumeMode,
+            hops = V.resumeHops or 0,
+            private = inPrivateServer(),
+            flags = flags,
         }))
     end)
 end
 
 local function queueReexec()
     if type(queue_on_teleport) ~= "function" then return end
+    if V.reexecQueued then return end
+    V.reexecQueued = true
     local src = table.concat({
-        "task.wait(3)",
         "repeat task.wait(1) until game:IsLoaded()",
+        "local t0 = os.clock()",
+        "local function ready()",
+        "    local rs = game:GetService('ReplicatedStorage')",
+        "    local lib = rs:FindFirstChild('Library')",
+        "    local client = lib and lib:FindFirstChild('Client')",
+        "    local util = lib and lib:FindFirstChild('Util')",
+        "    local p = game:GetService('Players').LocalPlayer",
+        "    return client ~= nil and client:FindFirstChild('Network') ~= nil and client:FindFirstChild('DiamondMountainCmds') ~= nil and util ~= nil and util:FindFirstChild('DiamondMountainMerchant') ~= nil and p ~= nil and p.Character ~= nil and p.Character:FindFirstChild('HumanoidRootPart') ~= nil",
+        "end",
+        "while not ready() and os.clock() - t0 < 120 do task.wait(1) end",
+        "task.wait(3)",
         "local ok, err = pcall(function()",
         "    local s",
         "    if type(isfile) == 'function' and isfile('VY_DiamondMountain.luau') then s = readfile('VY_DiamondMountain.luau') end",
@@ -1524,77 +1637,98 @@ local function rootPlaceId()
     return K.ROOT_PLACE
 end
 
-local function inPrivateServer()
-    local ok, v = pcall(function() return game.PrivateServerId ~= "" and game.PrivateServerOwnerId ~= 0 end)
-    return ok and v == true
+
+local function teleportAttempts()
+    local root = rootPlaceId()
+    local list = {}
+    local target = pickOtherServer(root)
+    if target then list[#list + 1] = { kind = "instance", place = root, job = target } end
+    list[#list + 1] = { kind = "place", place = root }
+    return list
 end
 
-local function privateServerAccessCode()
-    local ok, body = pcall(game.HttpGet, game, string.format("https://games.roblox.com/v1/games/%d/private-servers?limit=100", game.GameId))
-    if not ok or type(body) ~= "string" then return nil end
-    local okJ, data = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
-    if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then return nil end
-    local want = tostring(game.PrivateServerId)
-    local first
-    for _, s in ipairs(data.data) do
-        if type(s) == "table" and type(s.accessCode) == "string" then
-            first = first or s.accessCode
-            if tostring(s.vipServerId) == want or tostring(s.id) == want then return s.accessCode end
-        end
+local function leaveInstanceForTeleport()
+    if not inInstance() then return true end
+    if isfn(G.Instancing, "Leave") then gcall(G.Instancing.Leave, true, true) end
+    local t0 = os.clock()
+    while state.alive and os.clock() - t0 < 15 do
+        local busy = isfn(G.Instancing, "IsBusy") and gval(G.Instancing.IsBusy) == true
+        if not inInstance() and not busy then return true end
+        task.wait(0.25)
     end
-    return first
+    return not inInstance()
 end
 
-local function doTeleport(sameServer)
+local function doTeleport()
     if V.teleporting then return end
     V.teleporting = true
-    local root = rootPlaceId()
+    local attempts = teleportAttempts()
+    if #attempts == 0 then
+        warnlog("rejoin: no usable teleport path from this place")
+        notify("Rejoin", "No usable teleport path from here", 6)
+        V.teleporting = false
+        return
+    end
+    V.resumeMode = "hop"
+    V.resumeHops = 0
     saveResume()
     queueReexec()
     local TS = game:GetService("TeleportService")
-    local ok, err = pcall(function()
-        if inPrivateServer() then
-            local code = privateServerAccessCode()
-            if code then
-                TS:TeleportToPrivateServer(root, code, { LocalPlayer })
-                return
-            end
-            if sameServer then
-                TS:TeleportToPlaceInstance(root, game.JobId, LocalPlayer)
-                return
-            end
-        end
-        if sameServer then
-            if game.PlaceId == root then
-                TS:TeleportToPlaceInstance(root, game.JobId, LocalPlayer)
-            else
-                TS:Teleport(root, LocalPlayer)
-            end
-        else
-            local target = pickOtherServer(root)
-            if target then
-                TS:TeleportToPlaceInstance(root, target, LocalPlayer)
-            else
-                TS:Teleport(root, LocalPlayer)
-            end
+    local failed = false
+    local conn = TS.TeleportInitFailed:Connect(function(player, result, msg)
+        if player == LocalPlayer then
+            failed = true
+            tlog("teleport attempt rejected: %s %s", tostring(result), tostring(msg))
+            if tostring(msg):lower():find("private instance", 1, true) then V.resumePrivate = true end
         end
     end)
-    if not ok then
-        warnlog("teleport failed: %s", tostring(err))
+    task.spawn(function()
+        for i, a in ipairs(attempts) do
+            if not state.alive then break end
+            failed = false
+            tlog("teleport attempt %d/%d: %s -> %s%s (place %s job %s private %s)", i, #attempts, a.kind, tostring(a.place or ("world " .. tostring(a.world))), a.job and (" @ " .. tostring(a.job):sub(1, 8)) or "", tostring(game.PlaceId), tostring(game.JobId):sub(1, 8), tostring(inPrivateServer()))
+            local ok, err = pcall(function()
+                if a.kind == "world" then
+                    if not leaveInstanceForTeleport() then error("could not leave the instance") end
+                    saveResume()
+                    queueReexec()
+                    local okW, res, msg = netInvoke("World" .. a.world .. "Teleport")
+                    if not okW or res ~= true then error(tostring(msg or res or "world teleport refused")) end
+                elseif a.kind == "instance" then
+                    TS:TeleportToPlaceInstance(a.place, a.job, LocalPlayer)
+                else
+                    TS:Teleport(a.place, LocalPlayer)
+                end
+            end)
+            if not ok then
+                tlog("teleport call failed: %s", tostring(err))
+                failed = true
+            end
+            local t0 = os.clock()
+            while state.alive and not failed and os.clock() - t0 < (a.kind == "world" and 30 or 12) do task.wait(0.25) end
+            if not failed then break end
+            task.wait(1)
+        end
+        pcall(function() conn:Disconnect() end)
         V.teleporting = false
-    end
+        if failed then
+            V.resumeMode = nil
+            V.trailClosedSince = os.clock() + 55
+            tlog("all teleport attempts refused, next try in 60s")
+            notify("Rejoin", "Teleport refused by the game, retrying in 60s", 6)
+        end
+    end)
 end
-
 local function trailClosedAction(st)
-    if not (F.trailRejoin or F.trailHop) then return end
+    if not F.trailHop then return end
     if not tonumber(tostring(F.trailChoice):match("%d+")) then return end
     if st.eggLeft then return end
     V.trailClosedSince = V.trailClosedSince or os.clock()
     if os.clock() - V.trailClosedSince < 5 then return end
     if V.teleporting then return end
-    state.status = string.format("trail %d closed: %s", st.number, F.trailHop and "hopping server" or "rejoining server")
-    notify("Trail closed", F.trailHop and "Hopping to another server" or "Rejoining the same server", 5)
-    doTeleport(not F.trailHop)
+    state.status = string.format("trail %d closed: hopping server", st.number)
+    notify("Trail closed", "Hopping to another server", 5)
+    doTeleport(false)
 end
 
 local function loadResume()
@@ -1908,13 +2042,8 @@ UI.TrailSec:AddDropdown({ Name = "Trail", Items = K.TRAIL_CHOICES, Default = F.t
     if type(v) == "string" then F.trailChoice = v end
 end })
 UI.TrailSec:AddToggle({ Name = "Open Trail Eggs When Opened", Default = true, Flag = "dm_trailHatch", Callback = function(v) F.trailHatch = v end })
-UI.tglTrailRejoin = UI.TrailSec:AddToggle({ Name = "Auto Rejoin Same Server When Trail Selected Closed", Default = false, Flag = "dm_trailRejoin", Callback = function(v)
-    F.trailRejoin = v
-    if v and UI.tglTrailHop and UI.tglTrailHop:Get() then UI.tglTrailHop:Set(false) end
-end })
 UI.tglTrailHop = UI.TrailSec:AddToggle({ Name = "Auto Server Hop When Trail Selected Closed", Default = false, Flag = "dm_trailHop", Callback = function(v)
     F.trailHop = v
-    if v and UI.tglTrailRejoin and UI.tglTrailRejoin:Get() then UI.tglTrailRejoin:Set(false) end
 end })
 UI.lblTrail = UI.TrailSec:AddLabel("Trail: -")
 
@@ -1935,34 +2064,41 @@ UI.ArtSec:AddButton({ Name = "Search Artifacts Now", Callback = function()
 end })
 
 UI.UpTab = tab("Upgrades", "trending-up")
-UI.UpSec = section(UI.UpTab, "Auto Upgrades")
+UI.UpSec = section(UI.UpTab, "Auto Buy Upgrades")
 UI.UpSec:AddToggle({ Name = "Auto Buy Upgrades", Default = false, Flag = "dm_autoUpgrades", Callback = function(v) F.autoUpgrades = v end })
-UI.UpSec:AddDropdown({ Name = "Objective", Items = K.OBJECTIVES, Default = F.objective, Flag = "dm_objective", Callback = function(v)
+UI.UpSec:AddDropdown({ Name = "Buy First", Items = K.OBJECTIVES, Default = F.objective, Flag = "dm_objective", Callback = function(v)
     if type(v) == "table" then v = v[1] end
     if K.OBJECTIVE_ORDER[v] ~= nil or v == K.OBJECTIVES[1] then F.objective = v end
 end })
+UI.lblRecommend = UI.UpSec:AddLabel("Next purchase: -")
+
+UI.UpPickSec = section(UI.UpTab, "Upgrades To Buy")
 for _, u in ipairs(K.UPGRADES) do
     if not u.Retired then
-        UI.UpSec:AddToggle({ Name = "Buy " .. u.Name, Default = true, Flag = "dm_up_" .. u.Key, Callback = function(v) F.upgradeEnabled[u.Key] = v end })
+        UI.UpPickSec:AddToggle({ Name = u.Name, Default = true, Flag = "dm_up_" .. u.Key, Callback = function(v) F.upgradeEnabled[u.Key] = v end })
     end
 end
-UI.UpTrackSec = section(UI.UpTab, "Upgrade Tracks")
+
+UI.UpTrackSec = section(UI.UpTab, "Your Upgrades")
 UI.lblUpgrades = {}
 for _, u in ipairs(K.UPGRADES) do
-    UI.lblUpgrades[u.Key] = UI.UpTrackSec:AddLabel(u.Name .. ": -")
+    if not u.Retired then
+        UI.lblUpgrades[u.Key] = UI.UpTrackSec:AddLabel(u.Name .. "  -")
+    end
 end
-UI.lblRecommend = UI.UpTrackSec:AddLabel("Next: -")
 
 UI.BoostSec = section(UI.UpTab, "Auto Use Boosts")
 UI.BoostSec:AddToggle({ Name = "Auto Use Boosts", Default = false, Flag = "dm_autoBoosts", Callback = function(v) F.autoBoosts = v end })
 for _, b in ipairs(K.BOOSTS) do
-    UI.BoostSec:AddToggle({ Name = "Use " .. b.Label, Default = true, Flag = "dm_boost_" .. b.Key, Callback = function(v) F.boostEnabled[b.Key] = v end })
+    UI.BoostSec:AddToggle({ Name = b.Label, Default = true, Flag = "dm_boost_" .. b.Key, Callback = function(v) F.boostEnabled[b.Key] = v end })
 end
-UI.BoostSec:AddToggle({ Name = "Prefer Tier II", Default = true, Flag = "dm_boostTier2", Callback = function(v) F.boostPreferTier2 = v end })
-UI.BoostSec:AddSlider({ Name = "Re-use when under", Min = 10, Max = 600, Default = 90, Decimals = 5, Suffix = "s", Flag = "dm_boostMinLeft", Callback = function(v) F.boostMinLeft = math.clamp(num(v, F.boostMinLeft), 10, 600) end })
+UI.BoostSec:AddToggle({ Name = "Use Tier II Boosts First", Default = true, Flag = "dm_boostTier2", Callback = function(v) F.boostPreferTier2 = v end })
+UI.BoostSec:AddSlider({ Name = "Re-use Before It Ends", Min = 10, Max = 600, Default = 90, Decimals = 5, Suffix = "s", Flag = "dm_boostMinLeft", Callback = function(v) F.boostMinLeft = math.clamp(num(v, F.boostMinLeft), 10, 600) end })
+
+UI.BoostStatSec = section(UI.UpTab, "Your Boosts")
 UI.lblBoosts = {}
 for _, b in ipairs(K.BOOSTS) do
-    UI.lblBoosts[b.Key] = UI.BoostSec:AddLabel(b.Label .. ": -")
+    UI.lblBoosts[b.Key] = UI.BoostStatSec:AddLabel(b.Label .. "  -")
 end
 
 UI.MerchTab = tab("Merchant", "store")
@@ -1971,7 +2107,7 @@ UI.MerchSec:AddToggle({ Name = "Auto Buy All Boosts From Merchant", Default = fa
 UI.MerchSec:AddToggle({ Name = "Only Boost Offers", Default = true, Flag = "dm_merchantOnlyBoosts", Callback = function(v) F.merchantOnlyBoosts = v end })
 UI.lblMerchant = UI.MerchSec:AddLabel("Merchant: -")
 UI.MerchSec:AddButton({ Name = "Visit Merchant Now", Callback = function()
-    V.merchantVisitDone = nil
+    V.merchantDoneWindow = nil
     V.merchantRetryAt = 0
     task.spawn(merchantRun)
 end })
@@ -2045,20 +2181,30 @@ loop("ui", 1, function()
     end
 
     local coins = acorns()
+    local allMax = true
     for _, u in ipairs(K.UPGRADES) do
-        local info = upgradeInfo(u)
-        local txt
-        if u.Retired or info.disabled then
-            txt = string.format("%s: tier %d/%d (retired)", u.Name, info.tier, info.max)
-        elseif info.tier >= info.max then
-            txt = string.format("%s: MAX (%s)", u.Name, tostring(info.power or ""))
-        else
-            txt = string.format("%s: tier %d/%d  next %s%s", u.Name, info.tier, info.max, info.cost and shorten(info.cost) or "?", (info.cost and info.cost <= coins) and " (affordable)" or "")
+        if not u.Retired and UI.lblUpgrades[u.Key] then
+            local info = upgradeInfo(u)
+            local txt
+            if info.disabled then
+                txt = string.format("%s  -  not available", u.Name)
+            elseif info.tier >= info.max then
+                txt = string.format("%s  -  MAX", u.Name)
+            else
+                allMax = false
+                txt = string.format("%s  -  level %d of %d, next costs %s acorns%s", u.Name, info.tier, info.max, info.cost and shorten(info.cost) or "?", (info.cost and info.cost <= coins) and " (you can afford it)" or "")
+            end
+            setText(UI.lblUpgrades[u.Key], txt)
         end
-        setText(UI.lblUpgrades[u.Key], txt)
     end
     local cand = pickUpgrade()
-    setText(UI.lblRecommend, cand and string.format("Next: %s -> tier %d (%s acorns)", cand.u.Name, cand.info.tier + 1, shorten(cand.info.cost)) or "Next: nothing affordable")
+    if cand then
+        setText(UI.lblRecommend, string.format("Next purchase: %s level %d for %s acorns", cand.u.Name, cand.info.tier + 1, shorten(cand.info.cost)))
+    elseif allMax then
+        setText(UI.lblRecommend, "Next purchase: everything is maxed")
+    else
+        setText(UI.lblRecommend, "Next purchase: nothing affordable right now")
+    end
 
     for _, b in ipairs(K.BOOSTS) do
         local t1 = isfn(G.BoostCmds, "GetTimer") and (gval(G.BoostCmds.GetTimer, b.Ids[1]) or 0) or 0
@@ -2066,14 +2212,22 @@ loop("ui", 1, function()
         local items = boostItems(b.Item)
         local n1, n2 = 0, 0
         for _, it in ipairs(items) do if it.tier == 2 then n2 += it.amount else n1 += it.amount end end
-        setText(UI.lblBoosts[b.Key], string.format("%s: I %s | II %s  (inv: %d / %d)", b.Label, t1 > 0 and (math.floor(t1 / 60) .. "m") or "off", t2 > 0 and (math.floor(t2 / 60) .. "m") or "off", n1, n2))
+        local active
+        if t2 > 0 then
+            active = string.format("Tier II active, %dm left", math.floor(t2 / 60))
+        elseif t1 > 0 then
+            active = string.format("Tier I active, %dm left", math.floor(t1 / 60))
+        else
+            active = "not active"
+        end
+        setText(UI.lblBoosts[b.Key], string.format("%s  -  %s  |  you own %d (I) and %d (II)", b.Label, active, n1, n2))
     end
 
     local ph = merchantPhase()
     if ph then
         local now = workspace:GetServerTimeNow()
         if ph.Arrived then
-            setText(UI.lblMerchant, string.format("Merchant: camp %d, leaves in %dm %02ds", ph.Camp, math.max(0, math.floor((ph.LeaveAt - now) / 60)), math.max(0, math.floor(ph.LeaveAt - now) % 60)))
+            setText(UI.lblMerchant, string.format("Merchant: camp %d, leaves in %dm %02ds%s", ph.Camp, math.max(0, math.floor((ph.LeaveAt - now) / 60)), math.max(0, math.floor(ph.LeaveAt - now) % 60), state.merchantNote and (" | " .. state.merchantNote) or ""))
         else
             setText(UI.lblMerchant, string.format("Merchant: traveling to camp %d (%ds)", ph.Camp, math.max(0, math.floor(ph.ArriveAt - now))))
         end
@@ -2113,7 +2267,7 @@ genv.VyDiamondMountain = {
     end,
     State = state,
     Features = F,
-    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume },
+    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume, teleportAttempts = teleportAttempts, merchantWindow = merchantWindow, merchantLedger = merchantLedger, inPrivateServer = inPrivateServer },
 }
 
 pcall(function()
@@ -2132,31 +2286,23 @@ task.spawn(function()
     local resume = loadResume()
     if resume then
         task.wait(2)
-        local function setFlag(key, flagName)
-            if resume[key] == nil then return end
-            local setter = Library.SetFlags and Library.SetFlags[flagName]
-            if type(setter) == "function" then pcall(setter, resume[key]) end
+        V.resumePrivate = resume.private == true
+        local flags = type(resume.flags) == "table" and resume.flags or {}
+        local late = { dm_autoTrail = true, dm_autoYeti = true, dm_bestEgg = true, dm_nearestEgg = true, dm_autoMerchant = true, dm_autoArtifacts = true, dm_autoUpgrades = true, dm_autoBoosts = true }
+        local function apply(name, value)
+            local setter = Library.SetFlags and Library.SetFlags[name]
+            if type(setter) == "function" then pcall(setter, value) end
         end
-        setFlag("trailChoice", "dm_trailChoice")
-        setFlag("trailHatch", "dm_trailHatch")
-        setFlag("trailRejoin", "dm_trailRejoin")
-        setFlag("trailHop", "dm_trailHop")
-        setFlag("autoFarm", "dm_farm")
-        setFlag("fastFarm", "dm_fastFarm")
-        setFlag("autoTap", "dm_autoTap")
-        setFlag("autoTrail", "dm_autoTrail")
-        log("resumed trail settings after server teleport")
-        if resume.originPlace and resume.originPlace ~= game.PlaceId and type(resume.world) == "number" and resume.world > 1 then
-            local okE = enterInstance()
-            if not okE then
-                log("Diamond Mountain not reachable here, teleporting to World %d", resume.world)
-                saveResume()
-                queueReexec()
-                local okW, errW = netInvoke("World" .. resume.world .. "Teleport")
-                if not okW then warnlog("world teleport failed: %s", tostring(errW)) end
-                return
-            end
+        for name, value in pairs(flags) do
+            if not late[name] then apply(name, value) end
         end
+        for name in pairs(late) do
+            if flags[name] ~= nil then apply(name, flags[name]) end
+        end
+        tlog("landed: place %s job %s private %s, resumed settings (%s)", tostring(game.PlaceId), tostring(game.JobId):sub(1, 8), tostring(inPrivateServer()), tostring(resume.mode or "?"))
+        local hereWorld = K.WORLD_PLACES[game.PlaceId]
+        V.resumeMode = nil
+        V.resumeHops = 0
     end
     local ok, err = enterInstance()
     if ok then
@@ -2165,6 +2311,16 @@ task.spawn(function()
     else
         state.status = "not inside Diamond Mountain (" .. tostring(err) .. ")"
         notify("VY HUB", "Could not enter Diamond Mountain: " .. tostring(err), 8)
+        local hereWorld = K.WORLD_PLACES[game.PlaceId]
+        if resume and type(resume.world) == "number" and hereWorld ~= nil and hereWorld ~= resume.world and (tonumber(resume.hops) or 0) < 2 then
+            tlog("mountain not enterable here, teleporting to World %d", resume.world)
+            V.resumeMode = resume.mode
+            V.resumeHops = (tonumber(resume.hops) or 0) + 1
+            saveResume()
+            queueReexec()
+            local okW, res, msg = netInvoke("World" .. resume.world .. "Teleport")
+            if not (okW and res == true) then tlog("world teleport failed: %s", tostring(msg or res)) end
+        end
     end
 end)
 
