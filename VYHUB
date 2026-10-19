@@ -74,6 +74,10 @@ local state = {
     merchantBought = 0,
     artifactsFound = 0,
     excursion = nil,
+    taps = 0,
+    trailHatched = 0,
+    hatchRequests = 0,
+    yetiPetsSent = 0,
     lastCampTeleport = 0,
     status = "starting",
     campTarget = nil,
@@ -200,6 +204,7 @@ G.PlayerPet = req("Library.Client.PlayerPet")
 G.EnchantCmds = req("Library.Client.EnchantCmds")
 G.UpgradeCmds = req("Library.Client.UpgradeCmds")
 G.MachineCmds = req("Library.Client.MachineCmds")
+G.BreakableFrontend = req("Library.Client.BreakableFrontend")
 
 local function netInvoke(name, ...)
     if not isfn(G.Network, "Invoke") then return false, "Network.Invoke unavailable" end
@@ -498,6 +503,8 @@ local function allDMEggs()
             end
             if typeof(pos) == "Vector3" then
                 local camp = K.CAMP_BY_EGG[e._id]
+                local trail
+                pcall(function() trail = tonumber(e._model and e._model:GetAttribute("DM_TrailEgg")) end)
                 out[#out + 1] = {
                     uid = e._uid or uid,
                     id = e._id,
@@ -507,6 +514,7 @@ local function allDMEggs()
                     maxCount = e._maxEggCount,
                     camp = camp,
                     campDist = dist(pos, camp.Pos),
+                    trail = trail,
                 }
             end
         end
@@ -517,22 +525,34 @@ end
 local function campEgg(campNumber)
     local best
     for _, e in ipairs(allDMEggs()) do
-        if e.camp.Number == campNumber and (not best or e.campDist < best.campDist) then best = e end
+        if e.camp.Number == campNumber and not e.trail and (not best or e.campDist < best.campDist) then best = e end
     end
     return best
 end
 
+F.nearestRange = 40
 local function nearestEgg()
     local p = playerPos()
     if not p then return nil end
     local best, bestD
     for _, e in ipairs(allDMEggs()) do
-        if e.campDist < 60 and campUnlocked(e.camp.Number) then
+        local d = dist(p, e.pos)
+        if d <= F.nearestRange and e.hatchable ~= false and (not bestD or d < bestD) then best, bestD = e, d end
+    end
+    if not best then
+        for _, e in ipairs(allDMEggs()) do
             local d = dist(p, e.pos)
-            if not bestD or d < bestD then best, bestD = e, d end
+            if d <= F.nearestRange and (not bestD or d < bestD) then best, bestD = e, d end
         end
     end
-    return best
+    return best, bestD
+end
+
+local function trailEgg(trailNumber)
+    for _, e in ipairs(allDMEggs()) do
+        if e.trail == trailNumber then return e end
+    end
+    return nil
 end
 
 local function maxHatch(egg)
@@ -552,7 +572,10 @@ end
 
 V.hatchFails = 0
 V.hatchLower, V.hatchLowerUntil = nil, 0
+V.lastHatchAt = 0
 local function hatchOnce(egg)
+    if os.clock() - V.lastHatchAt < math.max(0.15, F.hatchDelay) then return false, "hatch cooldown" end
+    V.lastHatchAt = os.clock()
     local amount = maxHatch(egg)
     local cost = eggCost(egg)
     if cost and cost > 0 then
@@ -564,9 +587,10 @@ local function hatchOnce(egg)
         amount = math.max(1, math.min(amount, affordable))
     end
     if V.hatchLower and os.clock() < V.hatchLowerUntil then amount = math.min(amount, V.hatchLower) end
+    V.lastHatchEgg, V.lastHatchReq = egg, os.clock()
     local ok, res, msg = netInvoke("CustomEggs_Hatch", egg.uid, amount)
     if ok and res == true then
-        state.hatched += amount
+        state.hatchRequests += amount
         V.hatchFails = 0
         state.status = string.format("hatching %s x%d", egg.id, amount)
         return true
@@ -577,7 +601,7 @@ local function hatchOnce(egg)
         a = math.max(1, math.floor(a / 2))
         local ok2, res2 = netInvoke("CustomEggs_Hatch", egg.uid, a)
         if ok2 and res2 == true then
-            state.hatched += a
+            state.hatchRequests += a
             V.hatchLower, V.hatchLowerUntil = a, os.clock() + 8
             V.hatchFails = 0
             state.status = string.format("hatching %s x%d", egg.id, a)
@@ -635,8 +659,62 @@ local function campBreakables(campNumber)
     return list
 end
 
-local function farmTick(campNumber)
-    local targets = campBreakables(campNumber)
+local function dmBreakableModels()
+    local list = {}
+    local things = workspace:FindFirstChild("__THINGS")
+    local folder = things and things:FindFirstChild("Breakables")
+    if not folder then return list end
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and m:GetAttribute("ParentID") == K.INSTANCE_ID and m:GetAttribute("BreakableUID") ~= nil then
+            list[#list + 1] = m
+        end
+    end
+    return list
+end
+
+local function breakablesNear(center, radius, skipMain)
+    local list = {}
+    for _, m in ipairs(dmBreakableModels()) do
+        local area = tostring(m:GetAttribute("AreaID") or "")
+        if not (skipMain and area:sub(1, 5) == "Main_") then
+            local ok, pos = pcall(function() return m:GetPivot().Position end)
+            if ok and dist(pos, center) <= radius then list[#list + 1] = m:GetAttribute("BreakableUID") end
+        end
+    end
+    return list
+end
+
+F.autoTap = false
+F.tapInterval = 0.05
+V.tapTarget = nil
+V.tapTargetAt = 0
+local function nearestBreakableUid()
+    local p = playerPos()
+    if not p then return nil end
+    if V.yetiTarget then return V.yetiTarget end
+    if F.fastFarm and V.tapPreferred and os.clock() - V.tapPreferredAt < 1 then return V.tapPreferred end
+    if os.clock() - V.tapTargetAt < 0.5 then return V.tapTarget end
+    V.tapTargetAt = os.clock()
+    local best, bestD
+    for _, m in ipairs(dmBreakableModels()) do
+        local ok, pos = pcall(function() return m:GetPivot().Position end)
+        if ok then
+            local d = dist(pos, p)
+            if d <= 80 and (not bestD or d < bestD) then best, bestD = m:GetAttribute("BreakableUID"), d end
+        end
+    end
+    V.tapTarget = best
+    return best
+end
+local function tapTick()
+    local uid = nearestBreakableUid()
+    if uid == nil then return end
+    netUnreliable("Breakables_PlayerDealDamage", uid)
+    state.taps += 1
+end
+
+local function farmTick(campNumber, overrideTargets)
+    local targets = overrideTargets or campBreakables(campNumber)
     if #targets == 0 then return end
     local pets = petEuids()
     if #pets == 0 then return end
@@ -664,6 +742,74 @@ local function farmTick(campNumber)
     netUnreliable("Breakables_PlayerDealDamage", targets[1])
     local ok, err = netFire("Breakables_JoinPetBulk", map)
     if ok then state.farmTicks += 1 else logOnce("farm-fire", "Breakables_JoinPetBulk failed: %s", tostring(err)) end
+end
+
+F.fastFarm = false
+V.fastAssign = {}
+V.tapPreferred = nil
+V.tapPreferredAt = 0
+
+local function breakableInfo(uid)
+    if not isfn(G.BreakableFrontend, "Get") then return nil end
+    local b = gval(G.BreakableFrontend.Get, uid)
+    if type(b) ~= "table" then return nil end
+    return {
+        uid = uid,
+        health = type(b.health) == "number" and b.health or (type(b.maxHealth) == "number" and b.maxHealth or math.huge),
+        maxHealth = type(b.maxHealth) == "number" and b.maxHealth or 0,
+        class = tostring(b.class or "Normal"),
+        pos = typeof(b.position) == "Vector3" and b.position or nil,
+    }
+end
+
+local function fastFarmTick(targetUids)
+    if #targetUids == 0 then return end
+    local pets = petEuids()
+    if #pets == 0 then return end
+    local infos, chests = {}, {}
+    for _, uid in ipairs(targetUids) do
+        local info = breakableInfo(uid)
+        if info and info.health > 0 then
+            if info.class ~= "Normal" then chests[#chests + 1] = info end
+            infos[#infos + 1] = info
+        end
+    end
+    if #infos == 0 then return end
+    local ordered = (#chests > 0) and chests or infos
+    table.sort(ordered, function(a, b)
+        if a.health ~= b.health then return a.health < b.health end
+        return tostring(a.uid) < tostring(b.uid)
+    end)
+    local map, changed = {}, false
+    for i, e in ipairs(pets) do
+        local target = ordered[((i - 1) % #ordered) + 1].uid
+        map[e] = target
+        if V.fastAssign[e] ~= target then changed = true end
+    end
+    V.fastAssign = map
+    local p = playerPos()
+    if p then
+        local best, bestH
+        for _, info in ipairs(ordered) do
+            if info.pos and dist(info.pos, p) <= 30 and (not bestH or info.health < bestH) then best, bestH = info.uid, info.health end
+        end
+        V.tapPreferred, V.tapPreferredAt = best, os.clock()
+    end
+    netUnreliable("Breakables_PlayerDealDamage", ordered[1].uid)
+    if changed or os.clock() - (V.fastLastSend or 0) > 1 then
+        V.fastLastSend = os.clock()
+        local ok, err = netFire("Breakables_JoinPetBulk", map)
+        if ok then state.farmTicks += 1 else logOnce("fastfarm-fire", "Breakables_JoinPetBulk failed: %s", tostring(err)) end
+    end
+end
+
+local function installBreakableWatcher()
+    local things = workspace:FindFirstChild("__THINGS")
+    local folder = things and things:FindFirstChild("Breakables")
+    if not folder then return end
+    track(folder.ChildRemoved:Connect(function()
+        V.fastDirty = true
+    end))
 end
 
 F.autoUpgrades = false
@@ -884,6 +1030,29 @@ local function scanCachedOffers()
     end
     return nil
 end
+local function installHatchListener()
+    if not isfn(G.Network, "Fired") then return end
+    local ok, signal = gcall(G.Network.Fired, "Eggs_PlayOpenAnimation")
+    if ok and signal and type(signal.Connect) == "function" then
+        track(signal:Connect(function(eggId, payload)
+            local n = 0
+            if type(payload) == "table" then
+                if type(payload.uids) == "table" then
+                    n = #payload.uids
+                else
+                    for _ in pairs(payload) do n += 1 end
+                end
+            end
+            if n <= 0 then return end
+            state.hatched += n
+            local last = V.lastHatchEgg
+            if last and last.trail and last.id == eggId and os.clock() - (V.lastHatchReq or 0) < 6 then
+                state.trailHatched += n
+            end
+        end))
+    end
+end
+
 local function installMerchantListener()
     if not isfn(G.Network, "Fired") then return end
     local ok, signal = gcall(G.Network.Fired, "Merchant_Updated")
@@ -1068,10 +1237,262 @@ F.selectedCamp = K.CAMP_NAMES[1]
 
 local function desiredCamp()
     if F.autoBestEgg then return K.CAMPS[bestCampNumber()] end
-    if F.autoNearestEgg and state.hatchTarget and state.hatchTarget.camp then return state.hatchTarget.camp end
     if F.autoBestCamp then return K.CAMPS[bestCampNumber()] end
     if F.autoCamp then return K.CAMP_BY_NAME[F.selectedCamp] or K.CAMPS[1] end
     return nil
+end
+
+local function dmAttrFolder()
+    local things = workspace:FindFirstChild("__THINGS")
+    local inst = things and things:FindFirstChild("Instances")
+    local f = inst and inst:FindFirstChild(K.INSTANCE_ID)
+    return f or dmModel()
+end
+local function serverNow()
+    return workspace:GetServerTimeNow()
+end
+
+F.autoYeti = false
+F.autoYetiSend = false
+V.yetiTarget = nil
+V.yetiLastLoad = 0
+V.yetiLastAssign = 0
+V.yetiLastTeleport = 0
+
+local function yetiInfo()
+    local f = dmAttrFolder()
+    if not f then return nil end
+    local info = {
+        uid = f:GetAttribute("DM_YetiUid"),
+        at = f:GetAttribute("DM_YetiAt"),
+        health = f:GetAttribute("DM_YetiHealth"),
+        maxHealth = f:GetAttribute("DM_YetiMaxHealth"),
+        backAt = f:GetAttribute("DM_YetiBackAt"),
+        floor = f:GetAttribute("DM_YetiFloor"),
+        stage = f:GetAttribute("DM_YetiStage"),
+    }
+    if type(info.uid) ~= "string" and type(info.uid) ~= "number" then info.uid = nil end
+    if typeof(info.at) ~= "Vector3" then
+        local m = dmModel()
+        local summit = m and m:FindFirstChild("Summit")
+        local arena = summit and summit:FindFirstChild("YetiArena")
+        if arena and arena:IsA("PVInstance") then info.at = arena:GetPivot().Position end
+    end
+    local ready = LocalPlayer:GetAttribute("DM_YetiReadyAt")
+    info.cooldown = type(ready) == "number" and math.max(0, ready - serverNow()) or 0
+    info.alive = info.uid ~= nil and type(info.health) == "number" and info.health > 0
+    return info
+end
+
+local function yetiStandPos(info)
+    local at = info.at
+    if typeof(at) ~= "Vector3" then return nil end
+    local y = type(info.floor) == "number" and info.floor + 3 or at.Y
+    local p = playerPos()
+    local dir = p and Vector3.new(p.X - at.X, 0, p.Z - at.Z) or Vector3.new(0, 0, 1)
+    dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(0, 0, 1)
+    return Vector3.new(at.X, y, at.Z) + dir * 14
+end
+
+local function yetiSendPets(info)
+    if not isfn(G.DMCmds, "Feature") then return end
+    local Y = gval(G.DMCmds.Feature, "Yeti")
+    local D = gval(G.DMCmds.Feature, "Deposit")
+    if type(Y) ~= "table" or type(D) ~= "table" then return end
+    local ok, reason, capacity = gval(Y.CanLoad)
+    if ok ~= true or type(capacity) ~= "number" or capacity <= 0 then return end
+    local okS, spare = gcall(D.Spare, {})
+    if not okS or type(spare) ~= "table" or #spare == 0 then return end
+    local Dmg = req("Library.Modules.InstanceDamageModules.DiamondMountain")
+    local scored = {}
+    for _, item in ipairs(spare) do
+        local uid, amount, power = nil, 0, 0
+        pcall(function() uid = item:GetUID() amount = item:GetAmount() end)
+        if Dmg and type(Dmg.Compute) == "function" then
+            local okC, v = gcall(Dmg.Compute, LocalPlayer, item, 0)
+            if okC and type(v) == "number" then power = v end
+        end
+        if uid and amount > 0 then scored[#scored + 1] = { uid = uid, amount = amount, power = power } end
+    end
+    table.sort(scored, function(a, b) return a.power > b.power end)
+    local stacks, left, n = {}, capacity, 0
+    for _, s in ipairs(scored) do
+        if left <= 0 or n >= 100 then break end
+        local take = math.min(s.amount, left)
+        if take > 0 then
+            stacks[s.uid] = take
+            left -= take
+            n += 1
+        end
+    end
+    if n == 0 then return end
+    local okL, res, msg = gcall(Y.LoadStacks, stacks)
+    if okL and res == true then
+        state.yetiPetsSent += (capacity - left)
+        log("sent %d pets to the Yeti", capacity - left)
+    else
+        logOnce("yeti-load-" .. tostring(msg), "Yeti pet load refused: %s", tostring(msg or res))
+    end
+end
+
+local function yetiTick()
+    local info = yetiInfo()
+    if not info then return end
+    state.yeti = info
+    if not info.alive or info.cooldown > 0 then
+        if state.excursion == "yeti" then releaseExcursion("yeti") end
+        V.yetiTarget = nil
+        if not info.alive then
+            state.status = type(info.backAt) == "number" and string.format("Yeti returns in %ds", math.max(0, math.floor(info.backAt - serverNow()))) or "Yeti not here"
+        else
+            state.status = string.format("Yeti cooldown %ds", math.floor(info.cooldown))
+        end
+        return
+    end
+    if state.excursion ~= nil and state.excursion ~= "yeti" then return end
+    state.excursion = "yeti"
+    local stand = yetiStandPos(info)
+    local p = playerPos()
+    if stand and p and dist(p, info.at) > 22 and os.clock() - V.yetiLastTeleport > 1.5 then
+        V.yetiLastTeleport = os.clock()
+        teleportTo(stand, info.at)
+    end
+    V.yetiTarget = info.uid
+    if os.clock() - V.yetiLastAssign > 0.5 then
+        V.yetiLastAssign = os.clock()
+        local pets = petEuids()
+        if #pets > 0 then
+            local map = {}
+            for _, e in ipairs(pets) do map[e] = info.uid end
+            netFire("Breakables_JoinPetBulk", map)
+        end
+        netUnreliable("Breakables_PlayerDealDamage", info.uid)
+    end
+    if F.autoYetiSend and os.clock() - V.yetiLastLoad > 30 then
+        V.yetiLastLoad = os.clock()
+        pcall(yetiSendPets, info)
+    end
+    state.status = string.format("fighting the Yeti (%s%%)", type(info.health) == "number" and type(info.maxHealth) == "number" and info.maxHealth > 0 and tostring(math.floor(info.health / info.maxHealth * 100)) or "?")
+end
+
+F.autoTrail = false
+F.trailHatch = true
+F.trailChoice = "Auto (first open trail)"
+K.TRAIL_CHOICES = { "Auto (first open trail)", "Trail 1", "Trail 2", "Trail 3", "Trail 4", "Trail 5", "Trail 6" }
+
+local function trailModel(i)
+    local m = dmModel()
+    local trails = m and m:FindFirstChild("Trails")
+    return trails and trails:FindFirstChild(tostring(i)) or nil
+end
+local function trailState(i)
+    local f = dmAttrFolder()
+    local now = serverNow()
+    local st = { number = i }
+    if f then
+        local sleep = tonumber(f:GetAttribute("DM_Trail" .. i .. "SleepUntil"))
+        local eggUntil = tonumber(f:GetAttribute("DM_Trail" .. i .. "EggUntil"))
+        st.sleepLeft = sleep and sleep > now and (sleep - now) or nil
+        st.eggLeft = eggUntil and eggUntil > now and (eggUntil - now) or nil
+        st.chest = tonumber(f:GetAttribute("DM_Trail" .. i .. "Chest")) or 1
+    end
+    local ready = tonumber(LocalPlayer:GetAttribute("DM_TrailReady" .. i))
+    st.rollIn = ready and math.max(0, ready - os.time()) or 0
+    local T = isfn(G.DMCmds, "Feature") and gval(G.DMCmds.Feature, "Trails") or nil
+    if type(T) == "table" and type(T.Closed) == "function" then
+        local c = gval(T.Closed, i)
+        st.closed = c == true
+    else
+        st.closed = st.sleepLeft ~= nil
+    end
+    if st.sleepLeft then st.closed = true end
+    st.open = not st.closed
+    return st
+end
+local function trailPoints(i)
+    local m = trailModel(i)
+    if not m then return nil end
+    local gate = m:FindFirstChild("Gate")
+    local clearing = m:FindFirstChild("Clearing")
+    local pedestal = clearing and clearing:FindFirstChild("EggPedestal")
+    local pts = {}
+    if gate and gate:IsA("BasePart") then pts.gate = gate.Position pts.past = gate.Position + gate.CFrame.LookVector * 25 end
+    if pedestal and pedestal:IsA("BasePart") then pts.pedestal = pedestal.Position end
+    if clearing and clearing:IsA("PVInstance") then pts.clearing = clearing:GetPivot().Position end
+    pts.center = pts.pedestal or pts.clearing or pts.past
+    return pts
+end
+local function pickTrail()
+    local n = tonumber(tostring(F.trailChoice):match("%d+"))
+    if n then return trailState(n) end
+    for i = 1, 6 do
+        local st = trailState(i)
+        if st.open and trailModel(i) then return st end
+    end
+    return nil
+end
+
+V.trailFarmTargets = nil
+V.trailLastTeleport = 0
+local function trailTick()
+    local st = pickTrail()
+    if not st then
+        V.trailFarmTargets = nil
+        if state.excursion == "trail" then releaseExcursion("trail") end
+        state.status = "no open trail"
+        return
+    end
+    state.trail = st
+    local pts = trailPoints(st.number)
+    if not pts or not pts.center then
+        V.trailFarmTargets = nil
+        if state.excursion == "trail" then releaseExcursion("trail") end
+        state.status = string.format("trail %d: model not found", st.number)
+        return
+    end
+    if st.closed and not st.eggLeft then
+        V.trailFarmTargets = nil
+        if state.excursion == "trail" then releaseExcursion("trail") end
+        state.status = string.format("trail %d closed%s", st.number, st.sleepLeft and string.format(" (%dm)", math.ceil(st.sleepLeft / 60)) or "")
+        return
+    end
+    if state.excursion ~= nil and state.excursion ~= "trail" then return end
+    state.excursion = "trail"
+    local p = playerPos()
+    local egg = st.eggLeft and trailEgg(st.number) or nil
+    if egg and F.trailHatch then
+        V.trailFarmTargets = nil
+        if p and dist(p, egg.pos) > 18 and os.clock() - V.trailLastTeleport > 1.5 then
+            V.trailLastTeleport = os.clock()
+            teleportTo(egg.pos + Vector3.new(0, 3, 8), egg.pos)
+            return
+        end
+        state.status = string.format("trail %d egg open (%ds): hatching %s", st.number, math.floor(st.eggLeft), egg.id)
+        hatchOnce(egg)
+        return
+    end
+    local targets = {}
+    for _, m in ipairs(dmBreakableModels()) do
+        if tostring(m:GetAttribute("AreaID")) == "Trail" .. st.number then targets[#targets + 1] = m:GetAttribute("BreakableUID") end
+    end
+    if #targets == 0 then targets = breakablesNear(pts.center, 260, true) end
+    V.trailFarmTargets = #targets > 0 and targets or nil
+    local standAt = pts.center + Vector3.new(0, 3, 0)
+    if #targets > 0 then
+        local m = nil
+        for _, mm in ipairs(dmBreakableModels()) do
+            if mm:GetAttribute("BreakableUID") == targets[1] then m = mm break end
+        end
+        if m then
+            local okP, pos = pcall(function() return m:GetPivot().Position end)
+            if okP then standAt = pos + Vector3.new(0, 3, 0) end
+        end
+    end
+    if p and dist(p, standAt) > 30 and os.clock() - V.trailLastTeleport > 1.5 then
+        V.trailLastTeleport = os.clock()
+        teleportTo(standAt)
+    end
+    state.status = string.format("farming trail %d (chest %d/3%s, %d targets)", st.number, st.chest or 1, st.rollIn > 0 and string.format(", roll in %ds", st.rollIn) or "", #targets)
 end
 
 local function loop(name, interval, fn)
@@ -1102,24 +1523,55 @@ loop("hatch", function() return math.max(0.15, F.hatchDelay) end, function()
         egg = nearestEgg()
     end
     if not egg then
-        state.status = "no camp egg found"
+        state.status = F.autoBestEgg and "no camp egg found" or string.format("no egg within %d studs", F.nearestRange)
         task.wait(1)
         return
     end
     state.hatchTarget = egg
-    if state.excursion ~= nil then return end
-    local p = playerPos()
-    if not p or dist(p, egg.camp.Pos) > K.CAMP_TOLERANCE then
-        keepAtCamp(egg.camp)
-        task.wait(0.3)
-        return
+    if F.autoBestEgg then
+        if state.excursion ~= nil then return end
+        local p = playerPos()
+        if not p or dist(p, egg.camp.Pos) > K.CAMP_TOLERANCE then
+            keepAtCamp(egg.camp)
+            task.wait(0.3)
+            return
+        end
     end
-    local ok = hatchOnce(egg)
-    if not ok then task.wait(1) end
+    local ok, msg = hatchOnce(egg)
+    if not ok and msg ~= "hatch cooldown" then task.wait(1) end
 end)
 
-loop("farm", 0.5, function()
+loop("tap", function() return math.max(0.02, F.tapInterval) end, function()
+    if not F.autoTap or not inInstance() then return end
+    tapTick()
+end)
+
+loop("yeti", 0.5, function()
+    if F.autoYeti and inInstance() then
+        yetiTick()
+    elseif state.excursion == "yeti" then
+        releaseExcursion("yeti")
+        V.yetiTarget = nil
+    end
+end)
+
+loop("trail", 0.5, function()
+    if F.autoTrail and inInstance() then
+        trailTick()
+    elseif state.excursion == "trail" then
+        releaseExcursion("trail")
+        V.trailFarmTargets = nil
+    end
+end)
+
+loop("farm", function() return F.fastFarm and 0.2 or 0.5 end, function()
     if not F.autoFarm or not inInstance() then return end
+    if state.excursion == "yeti" then return end
+    local tick = F.fastFarm and fastFarmTick or function(targets) farmTick(nil, targets) end
+    if state.excursion == "trail" then
+        if V.trailFarmTargets then tick(V.trailFarmTargets) end
+        return
+    end
     local camp = state.campTarget
     if not camp then
 
@@ -1132,7 +1584,32 @@ loop("farm", 0.5, function()
         end
         if bestD > 120 then return end
     end
-    farmTick(camp.Number)
+    if F.fastFarm then
+        fastFarmTick(campBreakables(camp.Number))
+    else
+        farmTick(camp.Number)
+    end
+end)
+
+loop("farmwatch", 0.05, function()
+    if F.fastFarm and F.autoFarm and V.fastDirty and inInstance() and state.excursion ~= "yeti" then
+        V.fastDirty = false
+        local targets = V.trailFarmTargets
+        if state.excursion ~= "trail" then
+            local camp = state.campTarget
+            if not camp then
+                local p = playerPos()
+                local bestD
+                for _, c in ipairs(K.CAMPS) do
+                    local d = p and dist(p, c.Pos) or math.huge
+                    if not bestD or d < bestD then camp, bestD = c, d end
+                end
+                if not camp or bestD > 120 then return end
+            end
+            targets = campBreakables(camp.Number)
+        end
+        if targets then fastFarmTick(targets) end
+    end
 end)
 
 loop("upgrades", 6, function()
@@ -1211,6 +1688,13 @@ UI.TeleSec:AddButton({ Name = "Teleport To Best Camp Now", Callback = function()
     if c then teleportTo(c.Pos) end
 end })
 
+UI.FarmSec = section(UI.MainTab, "Breakables")
+UI.FarmSec:AddToggle({ Name = "Auto Break Breakables (pets)", Default = true, Flag = "dm_farm", Callback = function(v) F.autoFarm = v end })
+UI.FarmSec:AddToggle({ Name = "Fast Farm (Efficient)", Default = false, Flag = "dm_fastFarm", Callback = function(v) F.fastFarm = v V.fastAssign = {} V.breakAssign = {} end })
+UI.FarmSec:AddToggle({ Name = "Auto Tap Nearest Breakables", Default = false, Flag = "dm_autoTap", Callback = function(v) F.autoTap = v end })
+UI.FarmSec:AddSlider({ Name = "Tap Interval", Min = 0.02, Max = 0.5, Default = 0.05, Decimals = 0.01, Suffix = "s", Flag = "dm_tapInterval", Callback = function(v) F.tapInterval = math.clamp(num(v, F.tapInterval), 0.02, 0.5) end })
+UI.lblFarm = UI.FarmSec:AddLabel("Farm ticks: 0 | Taps: 0")
+
 UI.EggTab = tab("Eggs", "egg")
 UI.EggSec = section(UI.EggTab, "Auto Hatch")
 UI.lblEgg = UI.EggSec:AddLabel("Egg: -")
@@ -1226,10 +1710,39 @@ UI.EggSec:AddToggle({ Name = "Disable Egg Animation", Default = true, Flag = "dm
 
 UI.EggSec:AddSlider({ Name = "Hatch Delay", Min = 0.15, Max = 3, Default = 0.6, Decimals = 0.05, Suffix = "s", Flag = "dm_hatchDelay", Callback = function(v) F.hatchDelay = math.clamp(num(v, F.hatchDelay), 0.15, 3) end })
 UI.EggSec:AddSlider({ Name = "Hatch Amount (0 = max)", Min = 0, Max = 99, Default = 0, Decimals = 1, Flag = "dm_hatchAmount", Callback = function(v) F.hatchAmountOverride = math.floor(math.clamp(num(v, F.hatchAmountOverride), 0, 99)) end })
+UI.EggSec:AddSlider({ Name = "Nearest Egg Range", Min = 10, Max = 120, Default = 40, Decimals = 5, Suffix = " studs", Flag = "dm_nearestRange", Callback = function(v) F.nearestRange = math.clamp(num(v, F.nearestRange), 10, 120) end })
 
-UI.FarmSec = section(UI.EggTab, "Breakables")
-UI.FarmSec:AddToggle({ Name = "Auto Break Breakables (pets)", Default = true, Flag = "dm_farm", Callback = function(v) F.autoFarm = v end })
-UI.lblFarm = UI.FarmSec:AddLabel("Farm ticks: 0")
+UI.YetiTab = tab("Summit", "snowflake")
+UI.YetiSec = section(UI.YetiTab, "The Yeti")
+UI.YetiSec:AddToggle({ Name = "Auto Fight The Yeti", Default = false, Flag = "dm_autoYeti", Callback = function(v) F.autoYeti = v end })
+UI.YetiSec:AddToggle({ Name = "Auto Send Pets To The Yeti", Default = false, Flag = "dm_autoYetiSend", Callback = function(v) F.autoYetiSend = v end })
+UI.lblYeti = UI.YetiSec:AddLabel("Yeti: -")
+UI.lblYeti2 = UI.YetiSec:AddLabel("Pets sent: 0")
+
+UI.TrailSec = section(UI.YetiTab, "Trails")
+UI.TrailSec:AddToggle({ Name = "Auto Farm Trail", Default = false, Flag = "dm_autoTrail", Callback = function(v) F.autoTrail = v end })
+UI.TrailSec:AddDropdown({ Name = "Trail", Items = K.TRAIL_CHOICES, Default = F.trailChoice, Flag = "dm_trailChoice", Callback = function(v)
+    if type(v) == "table" then v = v[1] end
+    if type(v) == "string" then F.trailChoice = v end
+end })
+UI.TrailSec:AddToggle({ Name = "Open Trail Eggs When Opened", Default = true, Flag = "dm_trailHatch", Callback = function(v) F.trailHatch = v end })
+UI.lblTrail = UI.TrailSec:AddLabel("Trail: -")
+
+UI.ArtSec = section(UI.YetiTab, "Mountain Artifacts")
+UI.ArtSec:AddToggle({ Name = "Auto Find Mountain Artifacts", Default = false, Flag = "dm_autoArtifacts", Callback = function(v)
+    F.autoArtifacts = v
+    V.artifactsAllFound = false
+end })
+UI.lblArtifacts = UI.ArtSec:AddLabel("Artifacts: -")
+UI.ArtSec:AddButton({ Name = "Search Artifacts Now", Callback = function()
+    V.artifactsAllFound = false
+    task.spawn(function()
+        local prev = F.autoArtifacts
+        F.autoArtifacts = true
+        artifactRun()
+        F.autoArtifacts = prev
+    end)
+end })
 
 UI.UpTab = tab("Upgrades", "trending-up")
 UI.UpSec = section(UI.UpTab, "Auto Upgrades")
@@ -1273,22 +1786,6 @@ UI.MerchSec:AddButton({ Name = "Visit Merchant Now", Callback = function()
     task.spawn(merchantRun)
 end })
 
-UI.ArtSec = section(UI.MerchTab, "Mountain Artifacts")
-UI.ArtSec:AddToggle({ Name = "Auto Find Mountain Artifacts", Default = false, Flag = "dm_autoArtifacts", Callback = function(v)
-    F.autoArtifacts = v
-    V.artifactsAllFound = false
-end })
-UI.lblArtifacts = UI.ArtSec:AddLabel("Artifacts: -")
-UI.ArtSec:AddButton({ Name = "Search Artifacts Now", Callback = function()
-    V.artifactsAllFound = false
-    task.spawn(function()
-        local prev = F.autoArtifacts
-        F.autoArtifacts = true
-        artifactRun()
-        F.autoArtifacts = prev
-    end)
-end })
-
 UI.MiscTab = tab("Misc", "settings-2")
 UI.PatchSec = section(UI.MiscTab, "Patches")
 UI.PatchSec:AddToggle({ Name = "Infinite Pet Speed", Default = false, Flag = "dm_infSpeed", Callback = function(v) F.infiniteSpeed = v end })
@@ -1315,8 +1812,40 @@ loop("ui", 1, function()
     setText(UI.lblAcorns, "Acorns: " .. shorten(acorns()) .. (inInstance() and "" or "  (not inside Diamond Mountain)"))
     local best = bestCampNumber()
     setText(UI.lblCamp, "Best camp: " .. (K.CAMPS[best] and K.CAMPS[best].Name or tostring(best)))
-    setText(UI.lblCounters, string.format("Hatched: %d | Upgrades: %d | Boosts: %d | Merchant: %d", state.hatched, state.upgradesBought, state.boostsUsed, state.merchantBought))
-    setText(UI.lblFarm, "Farm ticks: " .. tostring(state.farmTicks))
+    setText(UI.lblCounters, string.format("Hatched: %d (requested %d) | Upgrades: %d | Boosts: %d | Merchant: %d", state.hatched, state.hatchRequests, state.upgradesBought, state.boostsUsed, state.merchantBought))
+    setText(UI.lblFarm, string.format("Farm ticks: %d | Taps: %d", state.farmTicks, state.taps))
+    local st = state.trail
+    if F.autoTrail and st then
+        local txt
+        if st.eggLeft then
+            txt = string.format("Trail %d: egg open %ds", st.number, math.floor(st.eggLeft))
+        elseif st.closed then
+            txt = string.format("Trail %d: closed%s", st.number, st.sleepLeft and string.format(" (%dm)", math.ceil(st.sleepLeft / 60)) or "")
+        else
+            txt = string.format("Trail %d: open, chest %d/3%s", st.number, st.chest or 1, st.rollIn > 0 and string.format(", roll in %ds", st.rollIn) or "")
+        end
+        setText(UI.lblTrail, txt .. string.format(" | trail eggs hatched: %d", state.trailHatched))
+    else
+        local parts = {}
+        for i = 1, 6 do
+            local s = trailState(i)
+            parts[#parts + 1] = string.format("%d:%s", i, s.eggLeft and "EGG" or (s.closed and "closed" or "open"))
+        end
+        setText(UI.lblTrail, "Trails " .. table.concat(parts, "  "))
+    end
+    local yi = state.yeti or yetiInfo()
+    if yi then
+        local txt
+        if yi.alive then
+            txt = string.format("Yeti: alive %s%%%s", type(yi.health) == "number" and type(yi.maxHealth) == "number" and yi.maxHealth > 0 and tostring(math.floor(yi.health / yi.maxHealth * 100)) or "?", yi.cooldown > 0 and string.format(", your cooldown %ds", math.floor(yi.cooldown)) or "")
+        elseif type(yi.backAt) == "number" then
+            txt = string.format("Yeti: returns in %ds", math.max(0, math.floor(yi.backAt - serverNow())))
+        else
+            txt = "Yeti: not here"
+        end
+        setText(UI.lblYeti, txt)
+    end
+    setText(UI.lblYeti2, "Pets sent: " .. tostring(state.yetiPetsSent))
     local egg = state.hatchTarget
     if egg then
         local cost = eggCost(egg)
@@ -1375,12 +1904,15 @@ pcall(installMagnet)
 pcall(installNoHatchAnimation)
 pcall(installAntiAfk)
 pcall(installMerchantListener)
+pcall(installHatchListener)
+pcall(installBreakableWatcher)
 
 genv.VyDiamondMountain = {
     Stop = function()
         if not state.alive then return end
         state.alive = false
         F.infiniteSpeed, F.superMagnet, F.noHatchAnim = false, false, false
+        F.autoYeti, F.autoTrail, F.autoTap = false, false, false
         for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
         connections = {}
         for _, fn in ipairs(restoreFns) do pcall(fn) end
@@ -1391,6 +1923,7 @@ genv.VyDiamondMountain = {
     end,
     State = state,
     Features = F,
+    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels },
 }
 
 pcall(function()
