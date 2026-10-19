@@ -586,7 +586,6 @@ local function hatchOnce(egg)
         end
         amount = math.max(1, math.min(amount, affordable))
     end
-    if V.hatchLower and os.clock() < V.hatchLowerUntil then amount = math.min(amount, V.hatchLower) end
     V.lastHatchEgg, V.lastHatchReq = egg, os.clock()
     local ok, res, msg = netInvoke("CustomEggs_Hatch", egg.uid, amount)
     if ok and res == true then
@@ -595,18 +594,23 @@ local function hatchOnce(egg)
         state.status = string.format("hatching %s x%d", egg.id, amount)
         return true
     end
-
-    local a = amount
-    while state.alive and a > 1 do
-        a = math.max(1, math.floor(a / 2))
-        local ok2, res2 = netInvoke("CustomEggs_Hatch", egg.uid, a)
-        if ok2 and res2 == true then
-            state.hatchRequests += a
-            V.hatchLower, V.hatchLowerUntil = a, os.clock() + 8
-            V.hatchFails = 0
-            state.status = string.format("hatching %s x%d", egg.id, a)
-            return true
+    local text = string.lower(tostring(msg or res or ""))
+    local shortOnAcorns = text:find("afford", 1, true) or text:find("enough", 1, true) or text:find("acorn", 1, true) or text:find("coin", 1, true)
+    if shortOnAcorns then
+        local a = amount
+        while state.alive and a > 1 do
+            a = math.max(1, math.floor(a / 2))
+            local ok2, res2 = netInvoke("CustomEggs_Hatch", egg.uid, a)
+            if ok2 and res2 == true then
+                state.hatchRequests += a
+                V.hatchFails = 0
+                state.status = string.format("hatching %s x%d (not enough acorns for x%d)", egg.id, a, amount)
+                return true
+            end
         end
+    elseif text:find("quickly", 1, true) then
+        state.status = string.format("hatch %s: server rate limit, retrying", egg.id)
+        return false, "rate limit"
     end
     V.hatchFails += 1
     if V.hatchFails % 5 == 1 then
@@ -1099,7 +1103,16 @@ local function merchantRun()
     if V.merchantVisitDone == ph.Visit and os.clock() < V.merchantRetryAt then return end
     local stop = merchantStop(ph.Camp)
     if not stop then logOnce("nomerchantstop", "merchant stop part for camp %s not found", tostring(ph.Camp)) return end
-    if not holdExcursion("merchant", 20) then return end
+    local t0 = os.clock()
+    while state.alive and state.excursion ~= nil and state.excursion ~= "merchant" and state.excursion ~= "trail" and state.excursion ~= "yeti" do
+        if os.clock() - t0 > 20 then return end
+        task.wait(0.2)
+    end
+    if not state.alive then return end
+    local interrupted = state.excursion
+    state.excursion = "merchant"
+    if interrupted then log("merchant arrived: pausing %s to buy boosts", interrupted) end
+    task.wait(0.4)
     local before = playerPos()
     pcall(function()
         local campPos = K.CAMPS[ph.Camp] and K.CAMPS[ph.Camp].Pos or stop.Position
@@ -1434,6 +1447,116 @@ end
 
 V.trailFarmTargets = nil
 V.trailLastTeleport = 0
+F.trailRejoin = false
+F.trailHop = false
+K.RESUME_FILE = "VYHUB/DM_Resume.json"
+K.SCRIPT_URL = "https://raw.githubusercontent.com/92tg/VYHUB/main/VY_DiamondMountain.lua"
+V.trailClosedSince = nil
+V.teleporting = false
+
+local function saveResume()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder("VYHUB") then makefolder("VYHUB") end
+        writefile(K.RESUME_FILE, game:GetService("HttpService"):JSONEncode({
+            at = os.time(),
+            autoTrail = F.autoTrail,
+            trailChoice = F.trailChoice,
+            trailHatch = F.trailHatch,
+            trailRejoin = F.trailRejoin,
+            trailHop = F.trailHop,
+            autoFarm = F.autoFarm,
+            fastFarm = F.fastFarm,
+            autoTap = F.autoTap,
+        }))
+    end)
+end
+
+local function queueReexec()
+    if type(queue_on_teleport) ~= "function" then return end
+    local src = table.concat({
+        "task.wait(3)",
+        "repeat task.wait(1) until game:IsLoaded()",
+        "local ok, err = pcall(function()",
+        "    local s",
+        "    if type(isfile) == 'function' and isfile('VY_DiamondMountain.luau') then s = readfile('VY_DiamondMountain.luau') end",
+        "    if not s then s = game:HttpGet('" .. K.SCRIPT_URL .. "') end",
+        "    loadstring(s, '=VY_DiamondMountain')()",
+        "end)",
+        "if not ok then warn('[VY DiamondMountain] re-exec failed: ' .. tostring(err)) end",
+    }, "\n")
+    pcall(queue_on_teleport, src)
+end
+
+local function pickOtherServer()
+    local placeId = game.PlaceId
+    local body
+    for _, order in ipairs({ "Desc", "Asc" }) do
+        local ok, b = pcall(game.HttpGet, game, string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100", placeId, order))
+        if ok and type(b) == "string" and #b > 10 then body = b break end
+        task.wait(1)
+    end
+    if not body then return nil end
+    local okJ, data = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+    if not okJ or type(data) ~= "table" or type(data.data) ~= "table" then return nil end
+    local choices = {}
+    for _, s in ipairs(data.data) do
+        if type(s) == "table" and s.id ~= game.JobId and type(s.playing) == "number" and type(s.maxPlayers) == "number" and s.playing < s.maxPlayers and s.playing >= 1 then
+            choices[#choices + 1] = s.id
+        end
+    end
+    if #choices == 0 then return nil end
+    return choices[math.random(1, #choices)]
+end
+
+local function doTeleport(sameServer)
+    if V.teleporting then return end
+    V.teleporting = true
+    saveResume()
+    queueReexec()
+    local TS = game:GetService("TeleportService")
+    local ok, err = pcall(function()
+        if sameServer then
+            TS:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        else
+            local target = pickOtherServer()
+            if target then
+                TS:TeleportToPlaceInstance(game.PlaceId, target, LocalPlayer)
+            else
+                TS:Teleport(game.PlaceId, LocalPlayer)
+            end
+        end
+    end)
+    if not ok then
+        warnlog("teleport failed: %s", tostring(err))
+        V.teleporting = false
+    end
+end
+
+local function trailClosedAction(st)
+    if not (F.trailRejoin or F.trailHop) then return end
+    if not tonumber(tostring(F.trailChoice):match("%d+")) then return end
+    if st.eggLeft then return end
+    V.trailClosedSince = V.trailClosedSince or os.clock()
+    if os.clock() - V.trailClosedSince < 5 then return end
+    if V.teleporting then return end
+    state.status = string.format("trail %d closed: %s", st.number, F.trailHop and "hopping server" or "rejoining server")
+    notify("Trail closed", F.trailHop and "Hopping to another server" or "Rejoining the same server", 5)
+    doTeleport(not F.trailHop)
+end
+
+local function loadResume()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then return nil end
+    local ok, data = pcall(function()
+        if not isfile(K.RESUME_FILE) then return nil end
+        local raw = readfile(K.RESUME_FILE)
+        delfile(K.RESUME_FILE)
+        return game:GetService("HttpService"):JSONDecode(raw)
+    end)
+    if ok and type(data) == "table" and type(data.at) == "number" and os.time() - data.at < 600 then return data end
+    return nil
+end
+
 local function trailTick()
     local st = pickTrail()
     if not st then
@@ -1454,8 +1577,10 @@ local function trailTick()
         V.trailFarmTargets = nil
         if state.excursion == "trail" then releaseExcursion("trail") end
         state.status = string.format("trail %d closed%s", st.number, st.sleepLeft and string.format(" (%dm)", math.ceil(st.sleepLeft / 60)) or "")
+        trailClosedAction(st)
         return
     end
+    V.trailClosedSince = nil
     if state.excursion ~= nil and state.excursion ~= "trail" then return end
     state.excursion = "trail"
     local p = playerPos()
@@ -1475,8 +1600,12 @@ local function trailTick()
     for _, m in ipairs(dmBreakableModels()) do
         if tostring(m:GetAttribute("AreaID")) == "Trail" .. st.number then targets[#targets + 1] = m:GetAttribute("BreakableUID") end
     end
-    if #targets == 0 then targets = breakablesNear(pts.center, 260, true) end
     V.trailFarmTargets = #targets > 0 and targets or nil
+    if #targets == 0 then
+        state.status = string.format("trail %d: waiting for the boss chest", st.number)
+        task.wait(1.5)
+        return
+    end
     local standAt = pts.center + Vector3.new(0, 3, 0)
     if #targets > 0 then
         local m = nil
@@ -1528,6 +1657,7 @@ loop("hatch", function() return math.max(0.15, F.hatchDelay) end, function()
         return
     end
     state.hatchTarget = egg
+    if state.excursion == "merchant" then return end
     if F.autoBestEgg then
         if state.excursion ~= nil then return end
         local p = playerPos()
@@ -1542,7 +1672,7 @@ loop("hatch", function() return math.max(0.15, F.hatchDelay) end, function()
 end)
 
 loop("tap", function() return math.max(0.02, F.tapInterval) end, function()
-    if not F.autoTap or not inInstance() then return end
+    if not F.autoTap or not inInstance() or state.excursion == "merchant" then return end
     tapTick()
 end)
 
@@ -1566,7 +1696,7 @@ end)
 
 loop("farm", function() return F.fastFarm and 0.2 or 0.5 end, function()
     if not F.autoFarm or not inInstance() then return end
-    if state.excursion == "yeti" then return end
+    if state.excursion == "yeti" or state.excursion == "merchant" then return end
     local tick = F.fastFarm and fastFarmTick or function(targets) farmTick(nil, targets) end
     if state.excursion == "trail" then
         if V.trailFarmTargets then tick(V.trailFarmTargets) end
@@ -1726,6 +1856,14 @@ UI.TrailSec:AddDropdown({ Name = "Trail", Items = K.TRAIL_CHOICES, Default = F.t
     if type(v) == "string" then F.trailChoice = v end
 end })
 UI.TrailSec:AddToggle({ Name = "Open Trail Eggs When Opened", Default = true, Flag = "dm_trailHatch", Callback = function(v) F.trailHatch = v end })
+UI.tglTrailRejoin = UI.TrailSec:AddToggle({ Name = "Auto Rejoin Same Server When Trail Selected Closed", Default = false, Flag = "dm_trailRejoin", Callback = function(v)
+    F.trailRejoin = v
+    if v and UI.tglTrailHop and UI.tglTrailHop:Get() then UI.tglTrailHop:Set(false) end
+end })
+UI.tglTrailHop = UI.TrailSec:AddToggle({ Name = "Auto Server Hop When Trail Selected Closed", Default = false, Flag = "dm_trailHop", Callback = function(v)
+    F.trailHop = v
+    if v and UI.tglTrailRejoin and UI.tglTrailRejoin:Get() then UI.tglTrailRejoin:Set(false) end
+end })
 UI.lblTrail = UI.TrailSec:AddLabel("Trail: -")
 
 UI.ArtSec = section(UI.YetiTab, "Mountain Artifacts")
@@ -1923,7 +2061,7 @@ genv.VyDiamondMountain = {
     end,
     State = state,
     Features = F,
-    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels },
+    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume },
 }
 
 pcall(function()
@@ -1939,6 +2077,24 @@ pcall(function()
 end)
 
 task.spawn(function()
+    local resume = loadResume()
+    if resume then
+        task.wait(2)
+        local function setFlag(key, flagName)
+            if resume[key] == nil then return end
+            local setter = Library.SetFlags and Library.SetFlags[flagName]
+            if type(setter) == "function" then pcall(setter, resume[key]) end
+        end
+        setFlag("trailChoice", "dm_trailChoice")
+        setFlag("trailHatch", "dm_trailHatch")
+        setFlag("trailRejoin", "dm_trailRejoin")
+        setFlag("trailHop", "dm_trailHop")
+        setFlag("autoFarm", "dm_farm")
+        setFlag("fastFarm", "dm_fastFarm")
+        setFlag("autoTap", "dm_autoTap")
+        setFlag("autoTrail", "dm_autoTrail")
+        log("resumed trail settings after server teleport")
+    end
     local ok, err = enterInstance()
     if ok then
         state.status = "inside Diamond Mountain"
