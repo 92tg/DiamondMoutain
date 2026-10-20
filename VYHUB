@@ -75,6 +75,8 @@ local state = {
     artifactsFound = 0,
     excursion = nil,
     taps = 0,
+    orbs = 0,
+    ultimates = 0,
     trailHatched = 0,
     hatchRequests = 0,
     yetiPetsSent = 0,
@@ -205,6 +207,7 @@ G.EnchantCmds = req("Library.Client.EnchantCmds")
 G.UpgradeCmds = req("Library.Client.UpgradeCmds")
 G.MachineCmds = req("Library.Client.MachineCmds")
 G.BreakableFrontend = req("Library.Client.BreakableFrontend")
+G.UltimateCmds = req("Library.Client.UltimateCmds")
 G.Directory = req("Library.Directory")
 G.MasteryCmds = req("Library.Client.MasteryCmds")
 G.Functions = req("Library.Functions")
@@ -354,7 +357,6 @@ local function keepAtCamp(camp)
 end
 
 F.infiniteSpeed = false
-F.superMagnet = false
 F.noHatchAnim = true
 
 local function installSpeedHook()
@@ -378,65 +380,6 @@ local function installSpeedHook()
         log("pet speed hook installed")
     else
         warnlog("pet speed hook failed: %s", tostring(err))
-    end
-end
-
-V.magnetBackup = setmetatable({}, { __mode = "k" })
-local function applyMagnetConfig(r)
-    if type(r) ~= "table" then return end
-    if F.superMagnet and state.alive then
-        if type(r.config) ~= "table" then r.config = {} end
-        if V.magnetBackup[r.config] == nil then V.magnetBackup[r.config] = { orig = r.config.SuperMagnet } end
-        r.config.SuperMagnet = true
-    elseif type(r.config) == "table" and V.magnetBackup[r.config] then
-        r.config.SuperMagnet = V.magnetBackup[r.config].orig
-        V.magnetBackup[r.config] = nil
-    end
-end
-local function installMagnet()
-    local applied = 0
-    local function patch(mod, name, fn)
-        if type(mod) ~= "table" then return end
-        pcall(function() if type(setreadonly) == "function" then setreadonly(mod, false) end end)
-        local ok, err = pcall(fn, mod)
-        if ok then applied += 1 else warnlog("super magnet patch %s failed: %s", name, tostring(err)) end
-    end
-    patch(G.EnchantCmds, "EnchantCmds", function(e)
-        local o = e.GetPower
-        if type(o) ~= "function" then error("no GetPower") end
-        e.GetPower = function(...)
-            local p = ...
-            if F.superMagnet and state.alive and (p == "Super Magnet" or p == "Magnet") then return 999 end
-            return o(...)
-        end
-        restoreFns[#restoreFns + 1] = function() e.GetPower = o end
-    end)
-    patch(G.UpgradeCmds, "UpgradeCmds", function(u)
-        local o = u.GetPower
-        if type(o) ~= "function" then error("no GetPower") end
-        u.GetPower = function(...)
-            if F.superMagnet and state.alive and (...) == "Magnet" then return 999 end
-            return o(...)
-        end
-        restoreFns[#restoreFns + 1] = function() u.GetPower = o end
-    end)
-    patch(G.Instancing, "InstancingCmds", function(i)
-        local g = i.Get
-        if type(g) ~= "function" then error("no Get") end
-        i.Get = function(...)
-            local r = g(...)
-            if type(r) == "table" then pcall(applyMagnetConfig, r) end
-            return r
-        end
-        restoreFns[#restoreFns + 1] = function() i.Get = g end
-    end)
-    log("super magnet patches applied (%d/3)", applied)
-end
-local function refreshMagnetNow()
-
-    if isfn(G.Instancing, "Get") then
-        local r = gval(G.Instancing.Get)
-        if type(r) == "table" then pcall(applyMagnetConfig, r) end
     end
 end
 
@@ -693,7 +636,6 @@ local function breakablesNear(center, radius, skipMain)
 end
 
 F.autoTap = false
-F.tapInterval = 0.05
 V.tapTarget = nil
 V.tapTargetAt = 0
 local function nearestBreakableUid()
@@ -719,6 +661,86 @@ local function tapTick()
     if uid == nil then return end
     netUnreliable("Breakables_PlayerDealDamage", uid)
     state.taps += 1
+end
+
+F.autoOrbs = false
+V.orbMap = nil
+local function findOrbMap()
+    if type(V.orbMap) == "table" then return V.orbMap end
+    local ok, map = gcall(function()
+        local mod = RS.Library.Client:FindFirstChild("OrbCmds")
+        if not mod or type(getsenv) ~= "function" then return nil end
+        local env = getsenv(mod)
+        local fn = type(env) == "table" and env.ProcessCreate or nil
+        if type(fn) ~= "function" and type(getgc) == "function" then
+            for _, f in ipairs(getgc(false)) do
+                if type(f) == "function" and debug.info(f, "n") == "ProcessCreate" then fn = f break end
+            end
+        end
+        if type(fn) ~= "function" then return nil end
+        for _, up in pairs(debug.getupvalues(fn)) do
+            if type(up) == "table" then
+                local strKeys = false
+                for k in pairs(up) do
+                    if type(k) == "string" then strKeys = true break end
+                end
+                if not strKeys then return up end
+            end
+        end
+        return nil
+    end)
+    if ok and type(map) == "table" then V.orbMap = map end
+    return V.orbMap
+end
+local function orbTick()
+    local map = findOrbMap()
+    if not map then return end
+    local now = workspace:GetServerTimeNow()
+    local n = 0
+    for _, orb in pairs(map) do
+        if type(orb) == "table" and not orb._collected and not orb._destroyed and type(orb.Collect) == "function" then
+            local age = now - (tonumber(orb._timestamp) or now)
+            if age >= (tonumber(orb._pickupDelay) or 0) then
+                local ok = pcall(orb.Collect, orb, nil, nil, true)
+                if ok then n += 1 end
+            end
+        end
+    end
+    if n > 0 then state.orbs += n end
+end
+
+F.autoUltimate = false
+V.ultLastTry = 0
+local function equippedUltimate()
+    if not isfn(G.UltimateCmds, "GetEquippedItem") then return nil end
+    local item = gval(G.UltimateCmds.GetEquippedItem)
+    if item == nil then return nil end
+    local ok, id = gcall(function() return item:GetId() end)
+    if ok and type(id) == "string" then return id end
+    return nil
+end
+local function ultimateStatus()
+    local id = equippedUltimate()
+    if not id then return "Ultimate: none equipped" end
+    local pct = isfn(G.UltimateCmds, "GetChargePercentage") and gval(G.UltimateCmds.GetChargePercentage, id) or 0
+    local active = isfn(G.UltimateCmds, "IsActive") and gval(G.UltimateCmds.IsActive) or false
+    if active then return string.format("Ultimate: %s active (used %d times)", id, state.ultimates) end
+    return string.format("Ultimate: %s, %d%% charged (used %d times)", id, math.floor((tonumber(pct) or 0) * 100), state.ultimates)
+end
+local function ultimateTick()
+    local id = equippedUltimate()
+    if not id then return end
+    if isfn(G.UltimateCmds, "IsActive") and gval(G.UltimateCmds.IsActive) == true then return end
+    if isfn(G.UltimateCmds, "IsCharged") and gval(G.UltimateCmds.IsCharged, id) ~= true then return end
+    if os.clock() - V.ultLastTry < 3 then return end
+    V.ultLastTry = os.clock()
+    local ok, res, msg = netInvoke("Ultimates: Activate", id)
+    if ok and res then
+        state.ultimates += 1
+        log("ultimate %s activated", id)
+    else
+        logOnce("ult-" .. tostring(msg or res), "ultimate %s refused: %s", id, tostring(msg or res))
+    end
 end
 
 local function farmTick(campNumber, overrideTargets)
@@ -1857,9 +1879,18 @@ loop("hatch", function() return math.max(0.15, F.hatchDelay) end, function()
     if not ok and msg ~= "hatch cooldown" then task.wait(1) end
 end)
 
-loop("tap", function() return math.max(0.02, F.tapInterval) end, function()
-    if not F.autoTap or not inInstance() or state.excursion == "merchant" then return end
-    tapTick()
+track(game:GetService("RunService").Heartbeat:Connect(function()
+    if not state.alive or not F.autoTap or state.excursion == "merchant" then return end
+    if not inInstance() then return end
+    pcall(tapTick)
+end))
+
+loop("orbs", 0.15, function()
+    if F.autoOrbs and inInstance() then orbTick() end
+end)
+
+loop("ultimate", 1, function()
+    if F.autoUltimate and inInstance() then ultimateTick() end
 end)
 
 loop("yeti", 0.5, function()
@@ -2008,8 +2039,11 @@ UI.FarmSec = section(UI.MainTab, "Breakables")
 UI.FarmSec:AddToggle({ Name = "Auto Break Breakables (pets)", Default = true, Flag = "dm_farm", Callback = function(v) F.autoFarm = v end })
 UI.FarmSec:AddToggle({ Name = "Fast Farm (Efficient)", Default = false, Flag = "dm_fastFarm", Callback = function(v) F.fastFarm = v V.fastAssign = {} V.breakAssign = {} end })
 UI.FarmSec:AddToggle({ Name = "Auto Tap Nearest Breakables", Default = false, Flag = "dm_autoTap", Callback = function(v) F.autoTap = v end })
-UI.FarmSec:AddSlider({ Name = "Tap Interval", Min = 0.02, Max = 0.5, Default = 0.05, Decimals = 0.01, Suffix = "s", Flag = "dm_tapInterval", Callback = function(v) F.tapInterval = math.clamp(num(v, F.tapInterval), 0.02, 0.5) end })
-UI.lblFarm = UI.FarmSec:AddLabel("Farm ticks: 0 | Taps: 0")
+UI.FarmSec:AddToggle({ Name = "Auto Collect Orbs (Instant)", Default = false, Flag = "dm_autoOrbs", Callback = function(v) F.autoOrbs = v end })
+UI.FarmSec:AddToggle({ Name = "Auto Ultimate", Default = false, Flag = "dm_autoUltimate", Callback = function(v) F.autoUltimate = v end })
+UI.FarmSec:AddToggle({ Name = "Infinite Pet Speed", Default = false, Flag = "dm_infSpeed", Callback = function(v) F.infiniteSpeed = v end })
+UI.lblFarm = UI.FarmSec:AddLabel("Farm ticks: 0 | Taps: 0 | Orbs: 0")
+UI.lblUlt = UI.FarmSec:AddLabel("Ultimate: -")
 
 UI.EggTab = tab("Eggs", "egg")
 UI.EggSec = section(UI.EggTab, "Auto Hatch")
@@ -2114,11 +2148,6 @@ end })
 
 UI.MiscTab = tab("Misc", "settings-2")
 UI.PatchSec = section(UI.MiscTab, "Patches")
-UI.PatchSec:AddToggle({ Name = "Infinite Pet Speed", Default = false, Flag = "dm_infSpeed", Callback = function(v) F.infiniteSpeed = v end })
-UI.PatchSec:AddToggle({ Name = "Super Magnet (Auto Collect Orbs)", Default = false, Flag = "dm_superMagnet", Callback = function(v)
-    F.superMagnet = v
-    refreshMagnetNow()
-end })
 UI.PatchSec:AddToggle({ Name = "Anti AFK", Default = true, Flag = "dm_antiAfk", Callback = function(v) F.antiAfk = v end })
 UI.CtrlSec = section(UI.MiscTab, "Script")
 UI.CtrlSec:AddLabel("VY HUB Diamond Mountain v" .. K.VERSION)
@@ -2139,7 +2168,8 @@ loop("ui", 1, function()
     local best = bestCampNumber()
     setText(UI.lblCamp, "Best camp: " .. (K.CAMPS[best] and K.CAMPS[best].Name or tostring(best)))
     setText(UI.lblCounters, string.format("Hatched: %d (requested %d) | Upgrades: %d | Boosts: %d | Merchant: %d", state.hatched, state.hatchRequests, state.upgradesBought, state.boostsUsed, state.merchantBought))
-    setText(UI.lblFarm, string.format("Farm ticks: %d | Taps: %d", state.farmTicks, state.taps))
+    setText(UI.lblFarm, string.format("Farm ticks: %d | Taps: %d | Orbs: %d", state.farmTicks, state.taps, state.orbs))
+    setText(UI.lblUlt, ultimateStatus())
     local st = state.trail
     if F.autoTrail and st then
         local txt
@@ -2244,7 +2274,6 @@ loop("ui", 1, function()
 end)
 
 pcall(installSpeedHook)
-pcall(installMagnet)
 pcall(installNoHatchAnimation)
 pcall(installAntiAfk)
 pcall(installMerchantListener)
@@ -2255,13 +2284,12 @@ genv.VyDiamondMountain = {
     Stop = function()
         if not state.alive then return end
         state.alive = false
-        F.infiniteSpeed, F.superMagnet, F.noHatchAnim = false, false, false
+        F.infiniteSpeed, F.noHatchAnim, F.autoOrbs, F.autoUltimate = false, false, false, false
         F.autoYeti, F.autoTrail, F.autoTap = false, false, false
         for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
         connections = {}
         for _, fn in ipairs(restoreFns) do pcall(fn) end
         restoreFns = {}
-        pcall(refreshMagnetNow)
         pcall(function() if genv.Library and genv.Library.Unload then genv.Library:Unload() end end)
         log("stopped")
     end,
