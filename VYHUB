@@ -77,6 +77,9 @@ local state = {
     taps = 0,
     orbs = 0,
     ultimates = 0,
+    expeditionSends = 0,
+    fedPets = 0,
+    lootClaims = 0,
     trailHatched = 0,
     hatchRequests = 0,
     yetiPetsSent = 0,
@@ -208,6 +211,8 @@ G.UpgradeCmds = req("Library.Client.UpgradeCmds")
 G.MachineCmds = req("Library.Client.MachineCmds")
 G.BreakableFrontend = req("Library.Client.BreakableFrontend")
 G.UltimateCmds = req("Library.Client.UltimateCmds")
+G.PetCmds = req("Library.Client.PetCmds")
+G.DMDamage = req("Library.Modules.InstanceDamageModules.DiamondMountain")
 G.Directory = req("Library.Directory")
 G.MasteryCmds = req("Library.Client.MasteryCmds")
 G.Functions = req("Library.Functions")
@@ -422,13 +427,26 @@ local function installAntiAfk()
             end
         end
     end)
-    track(LocalPlayer.Idled:Connect(function()
-        if not (F.antiAfk and state.alive) then return end
+    local function nudge()
         pcall(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton2(Vector2.new())
+            local cam = workspace.CurrentCamera
+            VirtualUser:Button2Down(Vector2.new(0, 0), cam and cam.CFrame or CFrame.new())
+            task.wait(0.05)
+            VirtualUser:Button2Up(Vector2.new(0, 0), cam and cam.CFrame or CFrame.new())
         end)
+    end
+    track(LocalPlayer.Idled:Connect(function()
+        if not (F.antiAfk and state.alive) then return end
+        nudge()
     end))
+    task.spawn(function()
+        while state.alive do
+            task.wait(60)
+            if F.antiAfk and state.alive then nudge() end
+        end
+    end)
     log("anti-AFK installed")
 end
 
@@ -1399,6 +1417,67 @@ local function yetiStandPos(info)
     return Vector3.new(at.X, y, at.Z) + dir * 14
 end
 
+local function equippedUidSet()
+    local set = {}
+    if isfn(G.PetCmds, "GetEquippedItems") then
+        local ok, items = gcall(G.PetCmds.GetEquippedItems)
+        if ok and type(items) == "table" then
+            for _, it in pairs(items) do
+                if type(it) == "string" then
+                    set[it] = true
+                else
+                    local okU, uid = pcall(function() return it:GetUID() end)
+                    if okU and uid then set[uid] = true end
+                end
+            end
+        end
+    end
+    if isfn(G.PetCmds, "GetEquipped") then
+        local ok, list = gcall(G.PetCmds.GetEquipped)
+        if ok and type(list) == "table" then
+            for k, v in pairs(list) do
+                if type(v) == "string" then set[v] = true elseif type(k) == "string" then set[k] = true end
+                if type(v) == "table" and type(v.uid) == "string" then set[v.uid] = true end
+            end
+        end
+    end
+    return set
+end
+
+local function petPower(item)
+    if isfn(G.DMDamage, "Compute") then
+        local ok, v = gcall(G.DMDamage.Compute, LocalPlayer, item, 0)
+        if ok and type(v) == "number" then return v end
+    end
+    return 0
+end
+
+local function dmPetStacks()
+    local out = {}
+    if not isfn(G.DMCmds, "Feature") then return out end
+    local D = gval(G.DMCmds.Feature, "Deposit")
+    if type(D) ~= "table" then return out end
+    local okS, spare = gcall(D.Spare, {})
+    if not okS or type(spare) ~= "table" then return out end
+    local equipped = equippedUidSet()
+    for _, item in ipairs(spare) do
+        local uid, amount, id, pt, sh = nil, 0, nil, 0, false
+        pcall(function()
+            uid = item:GetUID()
+            amount = item:GetAmount()
+            id = item:GetId()
+            local d = item:GetData() or {}
+            pt = tonumber(d.pt) or 0
+            sh = d.sh == true
+        end)
+        if uid and amount > 0 then
+            out[#out + 1] = { uid = uid, item = item, id = id, amount = amount, pt = pt, sh = sh, power = petPower(item), equipped = equipped[uid] == true }
+        end
+    end
+    table.sort(out, function(a, b) return a.power > b.power end)
+    return out
+end
+
 local function yetiSendPets(info)
     if not isfn(G.DMCmds, "Feature") then return end
     local Y = gval(G.DMCmds.Feature, "Yeti")
@@ -1406,20 +1485,11 @@ local function yetiSendPets(info)
     if type(Y) ~= "table" or type(D) ~= "table" then return end
     local ok, reason, capacity = gval(Y.CanLoad)
     if ok ~= true or type(capacity) ~= "number" or capacity <= 0 then return end
-    local okS, spare = gcall(D.Spare, {})
-    if not okS or type(spare) ~= "table" or #spare == 0 then return end
-    local Dmg = req("Library.Modules.InstanceDamageModules.DiamondMountain")
     local scored = {}
-    for _, item in ipairs(spare) do
-        local uid, amount, power = nil, 0, 0
-        pcall(function() uid = item:GetUID() amount = item:GetAmount() end)
-        if Dmg and type(Dmg.Compute) == "function" then
-            local okC, v = gcall(Dmg.Compute, LocalPlayer, item, 0)
-            if okC and type(v) == "number" then power = v end
-        end
-        if uid and amount > 0 then scored[#scored + 1] = { uid = uid, amount = amount, power = power } end
+    for _, st in ipairs(dmPetStacks()) do
+        if not st.equipped then scored[#scored + 1] = st end
     end
-    table.sort(scored, function(a, b) return a.power > b.power end)
+    if #scored == 0 then return end
     local stacks, left, n = {}, capacity, 0
     for _, s in ipairs(scored) do
         if left <= 0 or n >= 100 then break end
@@ -1454,7 +1524,11 @@ local function yetiTick()
         end
         return
     end
-    if state.excursion ~= nil and state.excursion ~= "yeti" then return end
+    if state.excursion ~= nil and state.excursion ~= "yeti" and state.excursion ~= "trail" then return end
+    if state.excursion == "trail" then
+        V.trailFarmTargets = nil
+        log("Yeti is up: pausing the trail to fight it")
+    end
     state.excursion = "yeti"
     local stand = yetiStandPos(info)
     local p = playerPos()
@@ -1478,6 +1552,219 @@ local function yetiTick()
         pcall(yetiSendPets, info)
     end
     state.status = string.format("fighting the Yeti (%s%%)", type(info.health) == "number" and type(info.maxHealth) == "number" and info.maxHealth > 0 and tostring(math.floor(info.health / info.maxHealth * 100)) or "?")
+end
+
+F.autoExpedition = false
+V.expeditionLastRun = 0
+local function tripsFeature()
+    if not isfn(G.DMCmds, "Feature") then return nil end
+    local T = gval(G.DMCmds.Feature, "Trips")
+    return type(T) == "table" and T or nil
+end
+local function expeditionPedestalPos(i)
+    local m = dmModel()
+    local summit = m and m:FindFirstChild("Summit")
+    local exp = summit and summit:FindFirstChild("Expedition")
+    local ped = exp and exp:FindFirstChild("Pedestal" .. i)
+    if ped and ped:IsA("PVInstance") then return ped:GetPivot().Position end
+    return nil
+end
+local function claimPillarPos()
+    local m = dmModel()
+    local summit = m and m:FindFirstChild("Summit")
+    local exp = summit and summit:FindFirstChild("Expedition")
+    local pillar = exp and exp:FindFirstChild("ClaimPillar")
+    if pillar and pillar:IsA("PVInstance") then return pillar:GetPivot().Position end
+    return nil
+end
+local function expeditionPedestals()
+    local T = tripsFeature()
+    if not T then return nil end
+    local st = gval(T.Status) or gval(T.Cached)
+    if type(st) ~= "table" or type(st.pedestals) ~= "table" then return nil end
+    return st.pedestals, T
+end
+local function expeditionPower(i)
+    local D = isfn(G.DMCmds, "Feature") and gval(G.DMCmds.Feature, "Deposit") or nil
+    if type(D) ~= "table" then return 0 end
+    local ok, stacks = gcall(D.Stacks, "trip:" .. i)
+    if ok and type(stacks) == "table" and stacks[1] then return tonumber(stacks[1].power) or 0, stacks[1].id end
+    return 0, nil
+end
+local function expeditionRun()
+    local pedestals, T = expeditionPedestals()
+    if not pedestals then return end
+    local plan = {}
+    local candidates = dmPetStacks()
+    local used = {}
+    for i = 1, 4 do
+        local ped = pedestals[i]
+        if type(ped) == "table" and ped.unlocked == true then
+            local hasPet = type(ped.trip) == "table" and type(ped.trip.pet) == "table"
+            local curPower, curId = 0, nil
+            if hasPet then curPower, curId = expeditionPower(i) end
+            local best
+            for _, c in ipairs(candidates) do
+                local left = c.amount - (used[c.uid] or 0)
+                if not c.equipped and left > 0 and c.power > curPower then best = c break end
+            end
+            if best then
+                used[best.uid] = (used[best.uid] or 0) + 1
+                plan[#plan + 1] = { i = i, uid = best.uid, id = best.id, power = best.power, replace = hasPet, curPower = curPower, curId = curId }
+            end
+        end
+    end
+    if #plan == 0 then
+        state.expeditionNote = "all expeditions hold your best unequipped pets"
+        return
+    end
+    local t0 = os.clock()
+    while state.alive and state.excursion ~= nil and state.excursion ~= "expedition" do
+        if os.clock() - t0 > 20 then return end
+        task.wait(0.2)
+    end
+    if not state.alive then return end
+    state.excursion = "expedition"
+    local before = playerPos()
+    pcall(function()
+        for _, job in ipairs(plan) do
+            if not state.alive then break end
+            local pos = expeditionPedestalPos(job.i)
+            if pos then
+                teleportTo(pos + Vector3.new(0, 3, 4), pos)
+                task.wait(0.6)
+            end
+            if job.replace then
+                local okP, resP, msgP = gcall(T.Pull, job.i)
+                if not (okP and resP == true) then
+                    log("expedition %d: could not pick up %s (%s)", job.i, tostring(job.curId), tostring(msgP or resP))
+                    continue
+                end
+                task.wait(0.8)
+            end
+            local okS, resS, msgS = gcall(T.Send, job.i, job.uid)
+            if okS and resS == true then
+                state.expeditionSends += 1
+                log("expedition %d: sent %s (power %s%s)", job.i, tostring(job.id), tostring(job.power), job.replace and (", replaced " .. tostring(job.curId) .. " " .. tostring(job.curPower)) or "")
+            else
+                log("expedition %d: send failed (%s)", job.i, tostring(msgS or resS))
+            end
+            task.wait(0.8)
+        end
+    end)
+    state.expeditionNote = string.format("%d change(s) applied", #plan)
+    if before and state.alive then teleportTo(before) end
+    releaseExcursion("expedition")
+end
+
+F.autoFeedYeti = false
+F.feedMaxPower = 500
+V.feedLastRun = 0
+V.feedKeys = nil
+local function hypeFeature()
+    if not isfn(G.DMCmds, "Feature") then return nil end
+    local H = gval(G.DMCmds.Feature, "Hype")
+    return type(H) == "table" and H or nil
+end
+local function hypePadPos()
+    local f = dmAttrFolder()
+    local v = f and f:GetAttribute("DM_HypePad")
+    if typeof(v) == "Vector3" then return v end
+    return nil
+end
+local function feedCandidates()
+    local list = {}
+    for _, st in ipairs(dmPetStacks()) do
+        if not st.equipped and st.power <= F.feedMaxPower then list[#list + 1] = st end
+    end
+    return list
+end
+local function feedRun()
+    local H = hypeFeature()
+    if not H then return end
+    local cands = feedCandidates()
+    local keys, keyList, stacks, total = {}, {}, {}, 0
+    for _, c in ipairs(cands) do
+        local key = string.format("%s|%d|%d", tostring(c.id), c.pt, c.sh and 1 or 0)
+        if not keys[key] then keys[key] = true keyList[#keyList + 1] = key end
+        stacks[c.uid] = c.amount
+        total += c.amount
+    end
+    table.sort(keyList)
+    local sig = table.concat(keyList, ",")
+    if #keyList > 0 and sig ~= V.feedKeys and type(H.SetAutoFeed) == "function" then
+        local ok, res, msg = gcall(H.SetAutoFeed, true, keyList)
+        if ok and res == true then
+            V.feedKeys = sig
+            log("Yeti auto feed set for %d pet type(s)", #keyList)
+        else
+            logOnce("autofeed-" .. tostring(msg), "Yeti auto feed not accepted: %s", tostring(msg or res))
+        end
+    end
+    if total == 0 then
+        state.feedNote = "no unequipped pets under the power limit"
+        return
+    end
+    local pad = hypePadPos()
+    local t0 = os.clock()
+    while state.alive and state.excursion ~= nil and state.excursion ~= "feed" do
+        if os.clock() - t0 > 20 then return end
+        task.wait(0.2)
+    end
+    if not state.alive then return end
+    state.excursion = "feed"
+    local before = playerPos()
+    pcall(function()
+        if pad then
+            teleportTo(pad + Vector3.new(0, 3, 0))
+            task.wait(0.8)
+        end
+        local ok, power, msg = gcall(H.FeedStacks, stacks)
+        if ok and type(power) == "number" and power > 0 then
+            state.fedPets += total
+            state.feedNote = string.format("fed %d pets (+%s power)", total, shorten(power))
+            log("fed the Yeti %d pets for %s power", total, shorten(power))
+        else
+            state.feedNote = "feed refused: " .. tostring(msg or power)
+            logOnce("feed-" .. tostring(msg), "Yeti feed refused: %s", tostring(msg or power))
+        end
+    end)
+    if before and state.alive then teleportTo(before) end
+    releaseExcursion("feed")
+end
+
+F.autoClaimLoot = false
+F.claimMinutes = 6
+V.claimLastAt = 0
+local function claimRun()
+    local T = tripsFeature()
+    if not T then return end
+    local pos = claimPillarPos()
+    if not pos then logOnce("noclaimpillar", "claim pillar not found") return end
+    local t0 = os.clock()
+    while state.alive and state.excursion ~= nil and state.excursion ~= "claim" do
+        if os.clock() - t0 > 20 then return end
+        task.wait(0.2)
+    end
+    if not state.alive then return end
+    state.excursion = "claim"
+    local before = playerPos()
+    pcall(function()
+        teleportTo(pos + Vector3.new(0, 4, 0))
+        task.wait(0.8)
+        pcall(function() gval(T.Status) end)
+        local ok, res, msg = gcall(T.Claim, nil)
+        if ok and res == true then
+            state.lootClaims += 1
+            state.claimNote = "claimed " .. os.date("%H:%M:%S")
+            log("expedition loot claimed")
+        else
+            state.claimNote = "claim: " .. tostring(msg or res or "nothing to claim")
+        end
+    end)
+    V.claimLastAt = os.clock()
+    if before and state.alive then teleportTo(before) end
+    releaseExcursion("claim")
 end
 
 F.autoTrail = false
@@ -1967,7 +2254,27 @@ loop("boosts", 5, function()
     if F.autoBoosts then boostTick() end
 end)
 
-loop("merchant", 4, function()
+loop("expedition", 5, function()
+    if F.autoExpedition and inInstance() and os.clock() - V.expeditionLastRun > 30 then
+        V.expeditionLastRun = os.clock()
+        expeditionRun()
+    end
+end)
+
+loop("feed", 5, function()
+    if F.autoFeedYeti and inInstance() and os.clock() - V.feedLastRun > 60 then
+        V.feedLastRun = os.clock()
+        feedRun()
+    end
+end)
+
+loop("claim", 5, function()
+    if F.autoClaimLoot and inInstance() and os.clock() - V.claimLastAt >= math.max(1, F.claimMinutes) * 60 then
+        claimRun()
+    end
+end)
+
+loop("merchant", 1, function()
     if F.autoMerchant and inInstance() then merchantRun() end
 end)
 
@@ -2067,7 +2374,30 @@ UI.YetiSec = section(UI.YetiTab, "The Yeti")
 UI.YetiSec:AddToggle({ Name = "Auto Fight The Yeti", Default = false, Flag = "dm_autoYeti", Callback = function(v) F.autoYeti = v end })
 UI.YetiSec:AddToggle({ Name = "Auto Send Pets To The Yeti", Default = false, Flag = "dm_autoYetiSend", Callback = function(v) F.autoYetiSend = v end })
 UI.lblYeti = UI.YetiSec:AddLabel("Yeti: -")
+UI.YetiSec:AddToggle({ Name = "Auto Feed The Yeti", Default = false, Flag = "dm_autoFeed", Callback = function(v)
+    F.autoFeedYeti = v
+    V.feedLastRun = 0
+    if not v then
+        task.spawn(function()
+            local H = hypeFeature()
+            if H and type(H.SetAutoFeed) == "function" then gcall(H.SetAutoFeed, false) end
+            V.feedKeys = nil
+        end)
+    end
+end })
+UI.YetiSec:AddSlider({ Name = "Feed Pets With Power Up To", Min = 100, Max = 15000, Default = 500, Decimals = 100, Flag = "dm_feedMaxPower", Callback = function(v) F.feedMaxPower = math.clamp(num(v, F.feedMaxPower), 100, 15000) V.feedKeys = nil end })
 UI.lblYeti2 = UI.YetiSec:AddLabel("Pets sent: 0")
+UI.lblFeed = UI.YetiSec:AddLabel("Feed: -")
+
+UI.ExpSec = section(UI.YetiTab, "Expeditions")
+UI.ExpSec:AddToggle({ Name = "Auto Send Pets To Expedition", Default = false, Flag = "dm_autoExpedition", Callback = function(v) F.autoExpedition = v V.expeditionLastRun = 0 end })
+UI.lblExpedition = UI.ExpSec:AddLabel("Expeditions: -")
+UI.ExpSec:AddToggle({ Name = "Auto Claim Expedition Loot", Default = false, Flag = "dm_autoClaimLoot", Callback = function(v) F.autoClaimLoot = v V.claimLastAt = 0 end })
+UI.ExpSec:AddTextbox({ Name = "Claim Every (minutes)", Placeholder = "6", Default = "6", Numeric = true, Finished = true, Flag = "dm_claimMinutes", Callback = function(v)
+    local n = tonumber(tostring(v):match("[%d%.]+"))
+    if n and n >= 1 then F.claimMinutes = n end
+end })
+UI.lblClaim = UI.ExpSec:AddLabel("Loot: -")
 
 UI.TrailSec = section(UI.YetiTab, "Trails")
 UI.TrailSec:AddToggle({ Name = "Auto Farm Trail", Default = false, Flag = "dm_autoTrail", Callback = function(v) F.autoTrail = v end })
@@ -2202,6 +2532,31 @@ loop("ui", 1, function()
         setText(UI.lblYeti, txt)
     end
     setText(UI.lblYeti2, "Pets sent: " .. tostring(state.yetiPetsSent))
+    do
+        local f = dmAttrFolder()
+        local meter = f and tonumber(f:GetAttribute("DM_HypeMeter")) or 0
+        local need = f and tonumber(f:GetAttribute("DM_HypeNeed")) or 0
+        local stage = f and tonumber(f:GetAttribute("DM_HypeStage")) or 1
+        local names = { "Normal", "Golden", "Rainbow", "Shiny", "Rainbow Shiny" }
+        setText(UI.lblFeed, string.format("Yeti: %s, charge %s / %s | fed %d pets%s", names[stage] or tostring(stage), shorten(meter), shorten(need), state.fedPets, state.feedNote and (" | " .. state.feedNote) or ""))
+    end
+    do
+        local pedestals = expeditionPedestals()
+        local parts = {}
+        if pedestals then
+            for i = 1, 4 do
+                local ped = pedestals[i]
+                if type(ped) == "table" then
+                    if not ped.unlocked then parts[#parts + 1] = i .. ":locked"
+                    elseif type(ped.trip) == "table" and type(ped.trip.pet) == "table" then parts[#parts + 1] = i .. ":" .. tostring(ped.trip.pet.id)
+                    else parts[#parts + 1] = i .. ":empty" end
+                end
+            end
+        end
+        setText(UI.lblExpedition, "Expeditions " .. (#parts > 0 and table.concat(parts, "  ") or "-") .. string.format(" | sent %d%s", state.expeditionSends, state.expeditionNote and (" | " .. state.expeditionNote) or ""))
+        local nextIn = math.max(0, math.floor(math.max(1, F.claimMinutes) * 60 - (os.clock() - V.claimLastAt)))
+        setText(UI.lblClaim, string.format("Loot: claimed %d times%s%s", state.lootClaims, F.autoClaimLoot and string.format(", next in %dm %02ds", math.floor(nextIn / 60), nextIn % 60) or "", state.claimNote and (" | " .. state.claimNote) or ""))
+    end
     local egg = state.hatchTarget
     if egg then
         local cost = eggCost(egg)
