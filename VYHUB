@@ -1767,6 +1767,36 @@ local function claimRun()
     releaseExcursion("claim")
 end
 
+K.LOADOUT_CHOICES = { "Don't Change", "Loadout 1", "Loadout 2", "Loadout 3", "Loadout 4", "Loadout 5" }
+F.trailLoadout = K.LOADOUT_CHOICES[1]
+F.arenaLoadout = K.LOADOUT_CHOICES[1]
+V.loadoutActivity = nil
+
+local function loadoutNumber(choice)
+    local n = tonumber(tostring(choice):match("%d+"))
+    if n and n >= 1 and n <= 5 then return n end
+    return nil
+end
+local function activeLoadout()
+    local s = getSave()
+    return s and tonumber(s.SelectedEnchantLoadout) or nil
+end
+local function equipLoadout(activity, choice)
+    if V.loadoutActivity == activity then return end
+    V.loadoutActivity = activity
+    local n = loadoutNumber(choice)
+    if not n then return end
+    if activeLoadout() == n then return end
+    local ok, res, msg = netInvoke("Enchants_ApplyLoadout", tostring(n))
+    if ok and res == true then
+        state.loadoutNote = string.format("Loadout %d for %s", n, activity)
+        log("enchant loadout %d equipped for %s", n, activity)
+    else
+        state.loadoutNote = string.format("Loadout %d refused: %s", n, tostring(msg or res))
+        logOnce("loadout-" .. tostring(msg or res), "enchant loadout %d not equipped for %s: %s", n, activity, tostring(msg or res))
+    end
+end
+
 F.autoTrail = false
 F.trailHatch = true
 F.trailChoice = "Auto (first open trail)"
@@ -2082,6 +2112,7 @@ local function trailTick()
     local egg = st.eggLeft and trailEgg(st.number) or nil
     if egg and F.trailHatch then
         V.trailFarmTargets = nil
+        equipLoadout("trail egg", F.trailLoadout)
         if p and dist(p, egg.pos) > 18 and os.clock() - V.trailLastTeleport > 1.5 then
             V.trailLastTeleport = os.clock()
             teleportTo(egg.pos + Vector3.new(0, 3, 8), egg.pos)
@@ -2218,6 +2249,7 @@ loop("farm", function() return F.fastFarm and 0.2 or 0.5 end, function()
         end
         if bestD > 120 then return end
     end
+    if camp.Number == bestCampNumber() then equipLoadout("arena", F.arenaLoadout) end
     if F.fastFarm then
         fastFarmTick(campBreakables(camp.Number))
     else
@@ -2345,11 +2377,19 @@ end })
 UI.FarmSec = section(UI.MainTab, "Breakables")
 UI.FarmSec:AddToggle({ Name = "Auto Break Breakables (pets)", Default = true, Flag = "dm_farm", Callback = function(v) F.autoFarm = v end })
 UI.FarmSec:AddToggle({ Name = "Fast Farm (Efficient)", Default = false, Flag = "dm_fastFarm", Callback = function(v) F.fastFarm = v V.fastAssign = {} V.breakAssign = {} end })
+UI.FarmSec:AddDropdown({ Name = "Farming Arena Loadout", Items = K.LOADOUT_CHOICES, Default = F.arenaLoadout, Flag = "dm_arenaLoadout", Callback = function(v)
+    if type(v) == "table" then v = v[1] end
+    if type(v) == "string" then
+        F.arenaLoadout = v
+        if V.loadoutActivity == "arena" then V.loadoutActivity = nil end
+    end
+end })
 UI.FarmSec:AddToggle({ Name = "Auto Tap Nearest Breakables", Default = false, Flag = "dm_autoTap", Callback = function(v) F.autoTap = v end })
 UI.FarmSec:AddToggle({ Name = "Auto Collect Orbs (Instant)", Default = false, Flag = "dm_autoOrbs", Callback = function(v) F.autoOrbs = v end })
 UI.FarmSec:AddToggle({ Name = "Auto Ultimate", Default = false, Flag = "dm_autoUltimate", Callback = function(v) F.autoUltimate = v end })
 UI.FarmSec:AddToggle({ Name = "Infinite Pet Speed", Default = false, Flag = "dm_infSpeed", Callback = function(v) F.infiniteSpeed = v end })
 UI.lblFarm = UI.FarmSec:AddLabel("Farm ticks: 0 | Taps: 0 | Orbs: 0")
+UI.lblLoadout = UI.FarmSec:AddLabel("Enchant loadout: -")
 UI.lblUlt = UI.FarmSec:AddLabel("Ultimate: -")
 
 UI.EggTab = tab("Eggs", "egg")
@@ -2406,6 +2446,13 @@ UI.TrailSec:AddDropdown({ Name = "Trail", Items = K.TRAIL_CHOICES, Default = F.t
     if type(v) == "string" then F.trailChoice = v end
 end })
 UI.TrailSec:AddToggle({ Name = "Open Trail Eggs When Opened", Default = true, Flag = "dm_trailHatch", Callback = function(v) F.trailHatch = v end })
+UI.TrailSec:AddDropdown({ Name = "Trail Egg Loadout", Items = K.LOADOUT_CHOICES, Default = F.trailLoadout, Flag = "dm_trailLoadout", Callback = function(v)
+    if type(v) == "table" then v = v[1] end
+    if type(v) == "string" then
+        F.trailLoadout = v
+        if V.loadoutActivity == "trail egg" then V.loadoutActivity = nil end
+    end
+end })
 UI.tglTrailHop = UI.TrailSec:AddToggle({ Name = "Auto Server Hop When Trail Selected Closed", Default = false, Flag = "dm_trailHop", Callback = function(v)
     F.trailHop = v
 end })
@@ -2500,6 +2547,10 @@ loop("ui", 1, function()
     setText(UI.lblCounters, string.format("Hatched: %d (requested %d) | Upgrades: %d | Boosts: %d | Merchant: %d", state.hatched, state.hatchRequests, state.upgradesBought, state.boostsUsed, state.merchantBought))
     setText(UI.lblFarm, string.format("Farm ticks: %d | Taps: %d | Orbs: %d", state.farmTicks, state.taps, state.orbs))
     setText(UI.lblUlt, ultimateStatus())
+    do
+        local cur = activeLoadout()
+        setText(UI.lblLoadout, string.format("Enchant loadout: %s active%s", cur and ("Loadout " .. cur) or "-", state.loadoutNote and (" | last: " .. state.loadoutNote) or ""))
+    end
     local st = state.trail
     if F.autoTrail and st then
         local txt
@@ -2650,7 +2701,7 @@ genv.VyDiamondMountain = {
     end,
     State = state,
     Features = F,
-    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume, teleportAttempts = teleportAttempts, merchantWindow = merchantWindow, merchantLedger = merchantLedger, inPrivateServer = inPrivateServer },
+    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume, teleportAttempts = teleportAttempts, merchantWindow = merchantWindow, merchantLedger = merchantLedger, inPrivateServer = inPrivateServer, equipLoadout = equipLoadout, activeLoadout = activeLoadout },
 }
 
 pcall(function()
