@@ -2150,6 +2150,164 @@ local function trailTick()
     state.status = string.format("farming trail %d (chest %d/3%s, %d targets)", st.number, st.chest or 1, st.rollIn > 0 and string.format(", roll in %ds", st.rollIn) or "", #targets)
 end
 
+F.webhookEnabled = false
+F.webhookUrl = ""
+F.webhookKeywords = { "huge", "titanic", "gargantuan" }
+F.webhookTest = true
+V.webhookSeen = nil
+state.webhooksSent = 0
+state.webhookNote = nil
+local HttpService = game:GetService("HttpService")
+
+local function httpRequestFn()
+    if type(request) == "function" then return request end
+    if type(http_request) == "function" then return http_request end
+    if type(http) == "table" and type(http.request) == "function" then return http.request end
+    if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+    return nil
+end
+local function webhookPost(payload)
+    local fn = httpRequestFn()
+    if not fn then
+        state.webhookNote = "executor has no HTTP request function"
+        return false
+    end
+    if type(F.webhookUrl) ~= "string" or not F.webhookUrl:find("^https://") then
+        state.webhookNote = "set a Discord webhook URL first"
+        return false
+    end
+    local ok, res = pcall(fn, { Url = F.webhookUrl, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = HttpService:JSONEncode(payload) })
+    if not ok then
+        state.webhookNote = "webhook request failed: " .. tostring(res)
+        return false
+    end
+    local code = type(res) == "table" and tonumber(res.StatusCode) or nil
+    if code and code >= 400 then
+        state.webhookNote = "Discord returned status " .. tostring(code) .. " (check the URL)"
+        return false
+    end
+    state.webhooksSent += 1
+    state.webhookNote = "sent " .. os.date("%H:%M:%S")
+    return true
+end
+local function petIconUrl(thumb)
+    local fn = httpRequestFn()
+    local assetId = type(thumb) == "string" and thumb:match("%d+") or nil
+    if not (fn and assetId) then return nil end
+    local api = string.format("https://thumbnails.roblox.com/v1/assets?assetIds=%s&size=420x420&format=Png&isCircular=false", assetId)
+    for _ = 1, 3 do
+        local ok, res = pcall(fn, { Url = api, Method = "GET" })
+        if ok and type(res) == "table" and type(res.Body) == "string" then
+            local okJ, json = pcall(HttpService.JSONDecode, HttpService, res.Body)
+            local entry = okJ and type(json) == "table" and type(json.data) == "table" and json.data[1] or nil
+            if type(entry) == "table" and entry.state == "Completed" and type(entry.imageUrl) == "string" then return entry.imageUrl end
+        end
+        task.wait(1)
+    end
+    return nil
+end
+local function webhookPets()
+    local s = getSave()
+    local inv = s and type(s.Inventory) == "table" and s.Inventory.Pet
+    return type(inv) == "table" and inv or nil
+end
+local function webhookPetDir(data)
+    local dir = G.Directory and G.Directory.Pets
+    return type(dir) == "table" and type(data) == "table" and dir[data.id] or nil
+end
+local function petDisplayName(data)
+    local dir = webhookPetDir(data)
+    local base = (type(dir) == "table" and dir.name) or tostring(data.id)
+    local prefix = ""
+    if data.sh then prefix = prefix .. "Shiny " end
+    if data.pt == 1 then prefix = prefix .. "Golden " elseif data.pt == 2 then prefix = prefix .. "Rainbow " end
+    return prefix .. base
+end
+local function webhookMatches(name)
+    local lower = string.lower(name)
+    for _, word in ipairs(F.webhookKeywords) do
+        if word ~= "" and string.find(lower, word, 1, true) then return true end
+    end
+    return false
+end
+local function setWebhookKeywords(text)
+    local list = {}
+    for word in string.gmatch(tostring(text or ""), "[^,]+") do
+        local w = string.lower(word):gsub("^%s+", ""):gsub("%s+$", "")
+        if w ~= "" then list[#list + 1] = w end
+    end
+    F.webhookKeywords = list
+end
+local function sendPetWebhook(name, amount, data)
+    local lower = string.lower(name)
+    local title, color = "🐾 PET OBTAINED!", 0x3498DB
+    if string.find(lower, "gargantuan", 1, true) then
+        title, color = "👑 GARGANTUAN OBTAINED!", 0x9B30FF
+    elseif string.find(lower, "titanic", 1, true) then
+        title, color = "🌟 TITANIC OBTAINED!", 0xFF0055
+    elseif string.find(lower, "huge", 1, true) then
+        title, color = "🎉 HUGE OBTAINED!", 0xFFD000
+    end
+    local dir = webhookPetDir(data)
+    local thumb = type(dir) == "table" and ((data.pt == 1 and dir.goldenThumbnail) or dir.thumbnail) or nil
+    local payload = {
+        username = "VY HUB Notifier",
+        embeds = { {
+            title = title,
+            description = string.format("**%s** just got a **%s**!", LocalPlayer.Name, name),
+            color = color,
+            fields = {
+                { name = "Pet", value = name, inline = true },
+                { name = "Amount owned", value = tostring(amount or 1), inline = true },
+                { name = "Game", value = "Pet Simulator 99 - Diamond Mountain", inline = true },
+            },
+            footer = { text = "VY HUB | " .. os.date("%Y-%m-%d %H:%M:%S") },
+        } },
+    }
+    local icon = petIconUrl(thumb)
+    if icon then payload.embeds[1].thumbnail = { url = icon } end
+    webhookPost(payload)
+end
+local function sendTestWebhook()
+    return webhookPost({ username = "VY HUB Notifier", content = string.format("✅ VY HUB Diamond Mountain notifier started for **%s** (watching: %s)", LocalPlayer.Name, table.concat(F.webhookKeywords, ", ")) })
+end
+local function webhookTick()
+    if not F.webhookEnabled then
+        V.webhookSeen = nil
+        return
+    end
+    local pets = webhookPets()
+    if not pets then
+        state.webhookNote = "inventory not readable yet"
+        return
+    end
+    if type(V.webhookSeen) ~= "table" then
+        local seen, count = {}, 0
+        for uid, data in pairs(pets) do
+            seen[uid] = type(data) == "table" and (tonumber(data._am) or 1) or 1
+            count += 1
+        end
+        V.webhookSeen = seen
+        state.webhookNote = string.format("watching %d pet stacks for: %s", count, table.concat(F.webhookKeywords, ", "))
+        return
+    end
+    for uid, data in pairs(pets) do
+        if type(data) == "table" then
+            local amount = tonumber(data._am) or 1
+            local prev = V.webhookSeen[uid]
+            if prev == nil or amount > prev then
+                local name = petDisplayName(data)
+                log("new pet: %s (x%d)", name, amount)
+                if webhookMatches(name) then task.spawn(sendPetWebhook, name, amount, data) end
+            end
+            V.webhookSeen[uid] = amount
+        end
+    end
+    for uid in pairs(V.webhookSeen) do
+        if pets[uid] == nil then V.webhookSeen[uid] = nil end
+    end
+end
+
 local function loop(name, interval, fn)
     task.spawn(function()
         while state.alive do
@@ -2314,6 +2472,8 @@ loop("artifacts", 10, function()
     if F.autoArtifacts and inInstance() then artifactRun() end
 end)
 
+loop("webhook", 2, webhookTick)
+
 if type(Library.ExecutorSettings) ~= "table" or type(Library.ExecutorSettings.MenuKeybind) ~= "string" or Library.ExecutorSettings.MenuKeybind == "" then
     pcall(function() Library:SetMenuKeybind(Enum.KeyCode.RightShift) end)
 end
@@ -2330,6 +2490,7 @@ UI.Window = Library:CreateWindow({
     SettingsTabEnabled = true,
     WatermarkEnabled = true,
     WatermarkText = "VY HUB | Diamond Mountain",
+    Theme = "Onyx",
 })
 
 local function tab(name, icon)
@@ -2526,6 +2687,19 @@ end })
 UI.MiscTab = tab("Misc", "settings-2")
 UI.PatchSec = section(UI.MiscTab, "Patches")
 UI.PatchSec:AddToggle({ Name = "Anti AFK", Default = true, Flag = "dm_antiAfk", Callback = function(v) F.antiAfk = v end })
+UI.HookSec = section(UI.MiscTab, "Discord Webhook")
+UI.HookSec:AddTextbox({ Name = "Webhook URL", Placeholder = "https://discord.com/api/webhooks/...", Finished = true, Flag = "dm_webhookUrl", Callback = function(v)
+    F.webhookUrl = type(v) == "string" and v:gsub("^%s+", ""):gsub("%s+$", "") or ""
+end })
+UI.HookSec:AddTextbox({ Name = "Pet Keywords (comma separated)", Default = "huge, titanic, gargantuan", Finished = true, Flag = "dm_webhookKeywords", Callback = function(v) setWebhookKeywords(v) end })
+UI.HookSec:AddToggle({ Name = "Webhook Notifications", Default = false, Flag = "dm_webhookEnabled", Callback = function(v)
+    F.webhookEnabled = v
+    V.webhookSeen = nil
+    if v and F.webhookTest then task.spawn(sendTestWebhook) end
+end })
+UI.HookSec:AddToggle({ Name = "Send Test Message When Enabled", Default = true, Flag = "dm_webhookTest", Callback = function(v) F.webhookTest = v end })
+UI.HookSec:AddButton({ Name = "Send Test Message Now", Callback = function() task.spawn(sendTestWebhook) end })
+UI.lblWebhook = UI.HookSec:AddLabel("Webhook: off")
 UI.CtrlSec = section(UI.MiscTab, "Script")
 UI.CtrlSec:AddLabel("VY HUB Diamond Mountain v" .. K.VERSION)
 UI.CtrlSec:AddLabel("Made By Vy | .gg/Fgaw3JZt6w")
@@ -2533,7 +2707,7 @@ UI.CtrlSec:AddButton({ Name = "Stop Script", Callback = function()
     if genv.VyDiamondMountain then genv.VyDiamondMountain.Stop() end
 end })
 
-pcall(function() UI.Window:CreateInfoPage({}) end)
+pcall(function() UI.Window:CreateInfoPage({ credits = { "Lead Developer: @vy", "UI Library: VyLib" } }) end)
 pcall(function() UI.Window:HideLoading() end)
 
 local function setText(lbl, text)
@@ -2677,6 +2851,7 @@ loop("ui", 1, function()
     for i = 1, 6 do if found[i] then n += 1 list[#list + 1] = tostring(i) end end
     state.artifactsFound = n
     setText(UI.lblArtifacts, string.format("Artifacts: %d/6 found %s", n, n > 0 and ("(" .. table.concat(list, ",") .. ")") or ""))
+    setText(UI.lblWebhook, string.format("Webhook: %s, %d sent%s", F.webhookEnabled and "on" or "off", state.webhooksSent, state.webhookNote and (" | " .. tostring(state.webhookNote)) or ""))
 end)
 
 pcall(installSpeedHook)
@@ -2701,7 +2876,7 @@ genv.VyDiamondMountain = {
     end,
     State = state,
     Features = F,
-    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume, teleportAttempts = teleportAttempts, merchantWindow = merchantWindow, merchantLedger = merchantLedger, inPrivateServer = inPrivateServer, equipLoadout = equipLoadout, activeLoadout = activeLoadout },
+    Debug = { inInstance = inInstance, nearestEgg = nearestEgg, tapTick = tapTick, nearestBreakableUid = nearestBreakableUid, allDMEggs = allDMEggs, yetiInfo = yetiInfo, trailState = trailState, pickTrail = pickTrail, dmBreakableModels = dmBreakableModels, pickOtherServer = pickOtherServer, saveResume = saveResume, loadResume = loadResume, teleportAttempts = teleportAttempts, merchantWindow = merchantWindow, merchantLedger = merchantLedger, inPrivateServer = inPrivateServer, equipLoadout = equipLoadout, activeLoadout = activeLoadout, webhookTick = webhookTick, sendTestWebhook = sendTestWebhook, sendPetWebhook = sendPetWebhook, petDisplayName = petDisplayName, webhookPost = webhookPost },
 }
 
 pcall(function()
